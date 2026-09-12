@@ -80,7 +80,8 @@ def write_cache(cache_path: Path, models: List[Dict[str, Any]]) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = cache_path.with_suffix(".tmp")
     tmp.write_text(
-        json.dumps({"fetched_at": datetime.now(timezone.utc).isoformat(), "models": models})
+        json.dumps({"fetched_at": datetime.now(timezone.utc).isoformat(), "models": models}),
+        encoding="utf-8",
     )
     tmp.replace(cache_path)
 

@@ -259,7 +259,7 @@ def _write_review(
         failing = report.failing_step()
         if failing is not None:
             lines += ["", f"failing_step: {failing.name}"]
-        (review_dir / "summary.md").write_text("\n".join(lines) + "\n")
+        (review_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
         for i, step in enumerate(report.steps, start=1):
             log = (
                 f"$ {step.name}\n"
@@ -270,7 +270,7 @@ def _write_review(
                 f"--- stdout ---\n{step.stdout}\n"
                 f"--- stderr ---\n{step.stderr}\n"
             )
-            (review_dir / f"verify-log-{i}.txt").write_text(log)
+            (review_dir / f"verify-log-{i}.txt").write_text(log, encoding="utf-8")
     except OSError as exc:
         print(f"council: warning: could not write review record: {exc}", file=sys.stderr)
     return review_dir

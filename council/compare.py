@@ -84,27 +84,53 @@ def _slug(model_id: str) -> str:
     return "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in model_id)
 
 
+def _normalize_diff_paths(diff: str) -> str:
+    """Rewrite `---`/`+++` header paths with forward slashes. Models on a
+    Windows-flavored streak emit `a/council\\task.py`; git apply won't
+    resolve that to `council/task.py`. Body lines are left untouched."""
+    out = []
+    for line in diff.splitlines():
+        if line.startswith(("--- ", "+++ ")) and "\\" in line:
+            out.append(line.replace("\\", "/"))
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
 def _apply_diff(workdir: Path, diff: str) -> Optional[str]:
     """Apply a unified diff inside workdir. Returns None on success, else
-    the error output (model produced a non-applicable diff)."""
+    the error output (model produced a non-applicable diff).
+
+    Tolerant by design: models miscount hunk headers constantly, so a
+    strict apply is retried with `git apply --recount` (recompute counts
+    from the hunk body). A diff whose *content* doesn't match the file is
+    still a FAIL — and correctly so.
+    """
     if shutil.which("git") is None:
         return "git not found on PATH — cannot apply diff"
+    diff = _normalize_diff_paths(diff)
     if not diff.endswith("\n"):
         # Model outputs often drop the trailing newline; git apply
         # rejects the hunk as corrupt without it.
         diff += "\n"
-    proc = subprocess.run(
+    attempts = [
         ["git", "apply", "--whitespace=fix", "-"],
-        input=diff,
-        cwd=workdir,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    if proc.returncode != 0:
+        ["git", "apply", "--whitespace=fix", "--recount", "-"],
+    ]
+    err = "git apply failed"
+    for cmd in attempts:
+        proc = subprocess.run(
+            cmd,
+            input=diff,
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode == 0:
+            return None
         err = (proc.stderr or proc.stdout or "git apply failed").strip()[:500]
-        return err
-    return None
+    return err
 
 
 @dataclass
@@ -203,7 +229,8 @@ def write_compare_report(project_dir: Path, report: CompareReport) -> Path:
     outdir = project_dir / ".council" / "compares" / report.compare_id
     outdir.mkdir(parents=True, exist_ok=True)
     for model_id, text in report.raw_responses.items():
-        (outdir / f"{_slug(model_id)}.md").write_text(text or "(no response)")
+        (outdir / f"{_slug(model_id)}.md").write_text(
+            text or "(no response)", encoding="utf-8")
     summary = {
         "compare_id": report.compare_id,
         "task": report.task_description,
@@ -217,7 +244,7 @@ def write_compare_report(project_dir: Path, report: CompareReport) -> Path:
             for r in report.rows
         ],
     }
-    (outdir / "summary.json").write_text(json.dumps(summary, indent=2))
+    (outdir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     lines = [f"# Compare {report.compare_id}", "",
              f"task: {report.task_description}", "",
              "| model | tier | verdict | latency | tokens (in/out) | est. cost |",
@@ -227,5 +254,5 @@ def write_compare_report(project_dir: Path, report: CompareReport) -> Path:
             f"| {r.model_id} | {r.cost_tier} | {r.verdict} | "
             f"{r.latency_seconds:.1f}s | {r.prompt_tokens}/{r.completion_tokens} | "
             f"${r.est_cost_usd:.6f} |")
-    (outdir / "summary.md").write_text("\n".join(lines) + "\n")
+    (outdir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return outdir
