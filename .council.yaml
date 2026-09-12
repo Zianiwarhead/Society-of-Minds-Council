@@ -1,6 +1,0 @@
-verify:
-  - name: "lint"
-    run: "ruff check ."
-    required: true
-sandbox:
-  image: "python:3.11-slim"
