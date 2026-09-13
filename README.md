@@ -1,55 +1,62 @@
-# Society of Minds Council — multi-model bake-offs, free-first routing
+# Society of Minds Council — minds racing, minds talking, verifier refereeing
+
+Free models race (`compare`), then build on each other (`collab`), while
+automated checks plus your judgment pick what survives. Bring your own
+keys; every run costs $0 until you invite a paid mind.
+
+## 5-minute quickstart
+```
+pip install pyyaml
+copy models.yaml.example models.yaml   # your overrides (small file, deltas only)
+copy .env.example .env                 # then fill in keys (never commit it)
+
+# Windows cmd:
+set OPENROUTER_API_KEY=...
+
+python -m council.cli models sync --provider openrouter   # live catalog -> cache
+python -m council.cli compare calc.py --task "fix add()" --tier free --live
+```
+
+Minimal `.council.yaml` in your project root (this is the referee):
+```yaml
+verify:
+  - name: "test"
+    run: "pytest tests/ -q"
+    required: true
+sandbox:
+  image: "python:3.11-slim"
+```
 
 ## Layout
 - `council/task.py`      — task ingestion (path mode + diff mode → `Task` object)
 - `council/config.py`    — loads `.council.yaml` (verify steps, sandbox settings)
 - `council/registry.py`  — loads `models.yaml` overrides (small: your deltas only)
 - `council/discovery.py` — live catalog cache + merge (`models sync`, `--live`)
-- `council/executor.py`  — OpenRouter chat client (stdlib only, BYOK via env)
+- `council/executor.py`  — OpenRouter + OpenCode backends (stdlib only, BYOK via env)
 - `council/compare.py`   — bake-off harness (fan-out, isolated verify, scoreboard)
-- `council/cli.py`       — `run` / `models` / `compare` entry points
+- `council/collab.py`    — council harness (write → review → revise, you directing)
+- `council/cli.py`       — `run` / `models` / `compare` / `collab` entry points
+- `examples/verify_game.py` — boot-check verifier for GUI bake-offs (parses ≠ runs)
 - `tests/`               — pytest suite (`pytest tests/ -q`)
 
-## Usage
-```
-pip install pyyaml
-
-# path mode
-python -m council.cli run src/login.py --task "add input validation" --project-dir .
-
-# diff mode
-python -m council.cli run --diff HEAD~1 --task "review this refactor" --project-dir .
-```
-
-Requires a `.council.yaml` in the project root:
-```yaml
-verify:
-  - name: "lint"
-    run: "ruff check ."
-    required: true
-sandbox:
-  image: "python:3.11-slim"
-```
-
 ## What this does and doesn't do
-`council run` now wires the full local pipeline: ingest → classify →
+`council run` wires the full local pipeline: ingest → classify →
 select model → run verifier → escalation decision. Exit codes: `0` DONE,
 `1` FAIL with a next model to try, `3` VERIFY_ERROR, `4` HUMAN_REVIEW
 (both write `.council/reviews/<task-id>/` per spec Section 7).
 
-What it still doesn't do: sandboxed (Docker) execution — the verifier
-runs on host, and `compare` verifies in temp copies (never your tree).
+No Docker sandbox yet — the verifier runs on host, and compare/collab
+verify in temp copies (never your tree). The council is only as smart
+as its verifier: a trivial check grades formatting, a behavioral check
+grades the fix. Parsses ≠ runs (see `examples/verify_game.py`).
 
 ## Bake-off (`council compare`)
-Same prompt to N models, each diff applied + verified in isolation:
+Same prompt to N models: fix mode (diffs applied + verified) or create
+mode (whole files, e.g. games):
 
 ```
-# one key covers most free + paid models
-set OPENROUTER_API_KEY=...
-
-python -m council.cli models sync --provider openrouter
-python -m council.cli compare src/login.py --task "fix the off-by-one" --tier free
-python -m council.cli compare src/login.py --task "..." --models "x/model-a,y/model-b"
+python -m council.cli compare src/login.py --task "fix the off-by-one" --tier free --live
+python -m council.cli compare --create game.py --task "write tetris in tkinter" --models "a,b" --live --timeout 300
 ```
 
 Prints a scoreboard (verdict / latency / tokens / est. cost) and writes
@@ -68,8 +75,14 @@ Round 1: everyone writes. Round 2: everyone reviews every peer's code
 as numbered corrections (`review-<critic>-on-<author>.md`). Round 3:
 everyone revises their *own* code, answering each correction
 (`FIXED: <n>` / `KEPT: <n> because ...`). Best verified wins.
-`--max-reviewers N` caps critics per author (pairs scale as N^2);
-`--feedback notes.txt` / `--interactive` put you in the director's chair.
+`--max-reviewers N` caps critics per author (pairs scale as N^2).
+
+You direct: `--feedback notes.txt` feeds playtest notes into the revise
+round; `--interactive` hands you the mic after every scoreboard (type
+notes, they revise, empty line stops).
+
+## License
+MIT — see `LICENSE`. BYOK: keys live in env/`.env`, never in the repo.
 
 ## OpenCode backend
 Any model OpenCode knows can be a council mind — no extra keys, auth
