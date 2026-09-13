@@ -12,7 +12,9 @@ from council import executor as ex
 from council.executor import (
     ExecutorError,
     build_create_prompt,
+    build_critique_prompt,
     build_prompt,
+    build_review_prompt,
     extract_code_block,
     extract_diff,
     safe_call,
@@ -161,3 +163,18 @@ def test_extract_code_block_falls_back_to_plain_fence():
 
 def test_extract_code_block_none_for_chat():
     assert extract_code_block("Tetris is a fun game with blocks!") is None
+
+
+def test_build_review_prompt_names_peer_and_code():
+    prompt = build_review_prompt("write x", "game.py", "print(1)", "free-b")
+    assert "REVIEW a peer" in prompt
+    assert "free-b" in prompt
+    assert "print(1)" in prompt
+    assert "Do NOT write code" in prompt
+
+
+def test_build_critique_prompt_carries_peer_reviews():
+    from council.executor import build_critique_prompt
+    prompt = build_critique_prompt("t", "g.py", "code", peer_reviews="fix loop")
+    assert "PEER REVIEW SAID" in prompt
+    assert "fix loop" in prompt

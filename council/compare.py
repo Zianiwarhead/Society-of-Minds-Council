@@ -139,6 +139,7 @@ class CompareReport:
     task_description: str
     rows: List[CompareRow] = field(default_factory=list)
     raw_responses: Dict[str, str] = field(default_factory=dict)
+    codes: Dict[str, str] = field(default_factory=dict)  # latest verified code per model
 
 
 def _fresh_copy(project_dir: Path) -> Path:

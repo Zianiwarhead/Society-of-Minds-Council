@@ -1,9 +1,14 @@
-"""Council mode — minds building on each other, not just racing.
+"""Council mode — minds talking to each other, not just racing.
 
-Phase 1: every model writes (same as a create bake-off), verified.
-Phase 2: every model receives the best Phase-1 code + verifier notes and
-returns an improved whole file, verified again.
-Winner: first Phase-2 PASS, else best Phase-1 PASS, else FAIL with notes.
+Phase 1 (write):   every model writes, verified.
+Phase 2 (review):  every model reviews every peer's code in prose.
+Phase 3 (revise):  every model revises its OWN code given peer reviews +
+                   verifier notes + human notes, verified again.
+Winner: first revising PASS, else best Phase-1 PASS.
+
+`run_revise_round` re-runs Phase 3 standalone so a human can direct
+extra rounds (`collab --interactive`): type notes, the council revises,
+repeat until empty input (max 5 rounds).
 
 Every round is verified in an isolated temp copy; the working tree is
 never touched. Transcripts land under .council/councils/<id>/.
@@ -14,7 +19,7 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from council import executor as _executor
@@ -27,6 +32,8 @@ from council.compare import (
 from council.config import CouncilConfig
 from council.registry import ModelEntry
 from council.verifier import run_verifier
+
+MAX_INTERACTIVE_ROUNDS = 5
 
 
 def _verify_code(code: str, filename: str, project_dir: Path,
@@ -51,6 +58,46 @@ def _verify_code(code: str, filename: str, project_dir: Path,
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _row_for(model: ModelEntry, res, filename: str, project_dir: Path,
+             config: CouncilConfig) -> Tuple[CompareRow, Optional[str]]:
+    """Verify one response, build its scoreboard row. Returns (row, code)."""
+    if not res.ok:
+        return CompareRow(
+            model.id, model.cost_tier, False, False, None,
+            error=res.error), None
+    code = _executor.extract_code_block(res.text)
+    if not code:
+        return CompareRow(
+            model.id, model.cost_tier, True, False, None,
+            latency_seconds=res.latency_seconds,
+            prompt_tokens=res.prompt_tokens,
+            completion_tokens=res.completion_tokens,
+            est_cost_usd=res.estimated_cost_usd(
+                model.cost_per_1k_input, model.cost_per_1k_output)), None
+    passed, verr, notes = _verify_code(code, filename, project_dir, config)
+    return CompareRow(
+        model.id, model.cost_tier, True, True, passed,
+        verify_error=verr,
+        latency_seconds=res.latency_seconds,
+        prompt_tokens=res.prompt_tokens,
+        completion_tokens=res.completion_tokens,
+        est_cost_usd=res.estimated_cost_usd(
+            model.cost_per_1k_input, model.cost_per_1k_output),
+        error=notes or None), code
+
+
+def _fan_out(models: List[ModelEntry], prompts: Dict[str, str],
+             timeout_seconds: int, max_workers: int):
+    """One parallel call per model. Returns [(model, result)]."""
+    workers = max(1, min(len(models), max_workers))
+
+    def _call(m: ModelEntry):
+        return m, _executor.safe_call(m, prompts[m.id], timeout_seconds)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(_call, models))
+
+
 def run_council(models: List[ModelEntry], filename: str, task_description: str,
                project_dir: Path, config: CouncilConfig,
                create_prompt: str, timeout_seconds: int = 180,
@@ -58,110 +105,105 @@ def run_council(models: List[ModelEntry], filename: str, task_description: str,
     compare_id = (datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
                   + "-council-" + uuid4().hex[:6])
     report = CompareReport(compare_id=compare_id, task_description=task_description)
-    workers = max(1, min(len(models), max_workers))
-
-    def _call(m: ModelEntry, prompt: str):
-        return m, _executor.safe_call(m, prompt, timeout_seconds)
 
     # ---- Phase 1: everyone writes ----
-    phase1: Dict[str, object] = {}
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        jobs = [(m, create_prompt) for m in models]
-        for model, res in pool.map(lambda j: _call(*j), jobs):
-            phase1[model.id] = res
-            report.raw_responses[f"phase1-{model.id}"] = res.text if res.ok else ""
-            if res.ok:
-                report.raw_responses[model.id] = res.text  # latest wins below
-
-    phase1_code: Dict[str, str] = {}
-    for model in models:
-        res = phase1[model.id]
-        if not res.ok:
-            report.rows.append(CompareRow(
-                model.id, model.cost_tier, False, False, None, error=res.error))
-            continue
-        code = _executor.extract_code_block(res.text)
-        if not code:
-            report.rows.append(CompareRow(
-                model.id, model.cost_tier, True, False, None,
-                latency_seconds=res.latency_seconds,
-                prompt_tokens=res.prompt_tokens,
-                completion_tokens=res.completion_tokens,
-                est_cost_usd=res.estimated_cost_usd(
-                    model.cost_per_1k_input, model.cost_per_1k_output)))
-            continue
-        passed, verr, notes = _verify_code(code, filename, project_dir, config)
-        phase1_code[model.id] = code
-        report.rows.append(CompareRow(
-            model.id, model.cost_tier, True, True, passed,
-            verify_error=verr,
-            latency_seconds=res.latency_seconds,
-            prompt_tokens=res.prompt_tokens,
-            completion_tokens=res.completion_tokens,
-            est_cost_usd=res.estimated_cost_usd(
-                model.cost_per_1k_input, model.cost_per_1k_output),
-            error=notes or None))
-
-    # Best Phase-1 code becomes the shared starting point: first PASS,
-    # else first code at all. Nobody to build on -> stop here.
-    base_id, base_code, base_notes = None, None, ""
-    for row in report.rows:
-        if row.verdict == "PASS" and row.model_id in phase1_code:
-            base_id, base_code = row.model_id, phase1_code[row.model_id]
-            base_notes = row.error or ""
-            break
-    if base_code is None and phase1_code:
-        base_id = next(iter(phase1_code))
-        base_code = phase1_code[base_id]
-    if base_code is None:
+    codes: Dict[str, str] = {}
+    for model, res in _fan_out(
+            models, {m.id: create_prompt for m in models},
+            timeout_seconds, max_workers):
+        report.raw_responses[f"phase1-{model.id}"] = res.text if res.ok else ""
+        if res.ok:
+            report.raw_responses[model.id] = res.text
+        row, code = _row_for(model, res, filename, project_dir, config)
+        report.rows.append(row)
+        if code:
+            codes[model.id] = code
+    if not codes:
         return report
 
-    # ---- Phase 2: everyone improves the shared base ----
-    def _revise(m: ModelEntry):
-        prompt = _executor.build_critique_prompt(
-            task_description, filename, base_code, base_notes, human_notes)
-        return m, _executor.safe_call(m, prompt, timeout_seconds)
+    # ---- Phase 2: peer review exchange ----
+    reviews: Dict[str, List[str]] = {m.id: [] for m in models}
+    if len(models) > 1:
+        jobs: Dict[str, str] = {}  # "critic\x00author" -> review prompt
+        for critic in models:
+            for author in models:
+                if critic.id == author.id or author.id not in codes:
+                    continue
+                jobs[f"{critic.id}\x00{author.id}"] = (
+                    _executor.build_review_prompt(
+                        task_description, filename,
+                        codes[author.id], author.id))
+        by_id = {m.id: m for m in models}
+        by_key = {key: by_id[key.split("\x00")[0]] for key in jobs}
+        workers = max(1, min(len(jobs), max_workers))
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        revisions = list(pool.map(_revise, models))
+        def _review_call(key: str):
+            critic = by_key[key]
+            return key, _executor.safe_call(critic, jobs[key], timeout_seconds)
 
-    final_rows: List[CompareRow] = []
-    for model, res in revisions:
-        tag = f"phase2-{model.id}"
-        report.raw_responses[tag] = res.text if res.ok else ""
-        report.raw_responses[model.id] = res.text if res.ok else report.raw_responses.get(model.id, "")
-        if not res.ok:
-            final_rows.append(CompareRow(
-                model.id, model.cost_tier, False, False, None, error=res.error))
-            continue
-        code = _executor.extract_code_block(res.text)
-        if not code:
-            final_rows.append(CompareRow(
-                model.id, model.cost_tier, True, False, None,
-                latency_seconds=res.latency_seconds,
-                prompt_tokens=res.prompt_tokens,
-                completion_tokens=res.completion_tokens,
-                est_cost_usd=res.estimated_cost_usd(
-                    model.cost_per_1k_input, model.cost_per_1k_output)))
-            continue
-        passed, verr, notes = _verify_code(code, filename, project_dir, config)
-        final_rows.append(CompareRow(
-            model.id, model.cost_tier, True, True, passed,
-            verify_error=verr,
-            latency_seconds=res.latency_seconds,
-            prompt_tokens=res.prompt_tokens,
-            completion_tokens=res.completion_tokens,
-            est_cost_usd=res.estimated_cost_usd(
-                model.cost_per_1k_input, model.cost_per_1k_output),
-            error=notes or None))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for key, res in pool.map(_review_call, list(by_key)):
+                critic_id, author_id = key.split("\x00")
+                tag = f"review-{critic_id}-on-{author_id}"
+                report.raw_responses[tag] = res.text if res.ok else ""
+                if res.ok and res.text.strip():
+                    reviews[author_id].append(
+                        f"--- review by {critic_id} ---\n{res.text.strip()[:2000]}")
 
-    # Winner replaces rows: Phase-2 PASS wins, else the Phase-1 story
-    # stands (revisions stay in the transcripts for inspection).
-    if any(r.verdict == "PASS" for r in final_rows):
-        for r in final_rows:
+    # ---- Phase 3: everyone revises their OWN code ----
+    phase1_notes = {r.model_id: (r.error or "") for r in report.rows
+                    if r.model_id in codes}
+    rows, codes = run_revise_round(
+        models, codes, reviews, filename, task_description,
+        project_dir, config, verifier_notes=phase1_notes,
+        human_notes=human_notes,
+        timeout_seconds=timeout_seconds, max_workers=max_workers,
+        round_tag="phase2", report=report)
+    if any(r.verdict == "PASS" for r in rows):
+        for r in rows:
             r.model_id = f"{r.model_id} (rev)"
-        report.rows = final_rows
+        report.rows = rows
+    report.codes = codes
     return report
+
+
+def run_revise_round(models: List[ModelEntry], codes: Dict[str, str],
+                     peer_reviews: Dict[str, List[str]],
+                     filename: str, task_description: str,
+                     project_dir: Path, config: CouncilConfig,
+                     verifier_notes: Optional[Dict[str, str]] = None,
+                     human_notes: str = "",
+                     timeout_seconds: int = 180,
+                     max_workers: int = 4, round_tag: str = "revise",
+                     report: Optional[CompareReport] = None
+                     ) -> Tuple[List[CompareRow], Dict[str, str]]:
+    """One revise round over each model's own latest code. Returns
+    (rows, new_codes). Appends transcripts to report when given."""
+    verifier_notes = verifier_notes or {}
+    prompts = {}
+    for m in models:
+        if m.id not in codes:
+            continue
+        prompts[m.id] = _executor.build_critique_prompt(
+            task_description, filename, codes[m.id],
+            verifier_notes.get(m.id, ""),
+            human_notes,
+            peer_reviews="\n\n".join(peer_reviews.get(m.id, [])),
+        )
+    revisers = [m for m in models if m.id in prompts]
+    rows: List[CompareRow] = []
+    new_codes = dict(codes)
+    for model, res in _fan_out(revisers, prompts, timeout_seconds, max_workers):
+        if report is not None:
+            tag = f"{round_tag}-{model.id}"
+            report.raw_responses[tag] = res.text if res.ok else ""
+            if res.ok:
+                report.raw_responses[model.id] = res.text
+        row, code = _row_for(model, res, filename, project_dir, config)
+        rows.append(row)
+        if code:
+            new_codes[model.id] = code
+    return rows, new_codes
 
 
 def write_council_report(project_dir: Path, report: CompareReport) -> Path:

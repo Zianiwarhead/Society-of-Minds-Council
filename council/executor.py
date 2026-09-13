@@ -87,9 +87,29 @@ def build_create_prompt(task_description: str, filename: str) -> str:
     ])
 
 
+def build_review_prompt(task_description: str, filename: str, peer_code: str,
+                        author_id: str) -> str:
+    """Ask one model to REVIEW a peer's code in prose (no code output).
+    The prose goes back to the author for the revise round."""
+    return "\n".join([
+        f"TASK: {task_description}",
+        "",
+        f"REVIEW a peer's solution ({filename}, written by {author_id}).",
+        "Reply in plain prose, short and specific:",
+        "1. Bugs or edge cases you can spot.",
+        "2. What is good and should be kept.",
+        "3. The single most valuable improvement.",
+        "Do NOT write code — words only, under 20 lines.",
+        "",
+        f"--- {author_id}'s {filename} ---",
+        peer_code[:20000],
+    ])
+
+
 def build_critique_prompt(task_description: str, filename: str, code: str,
                           verifier_notes: str = "",
-                          human_notes: str = "") -> str:
+                          human_notes: str = "",
+                          peer_reviews: str = "") -> str:
     """Assemble the revise round: the model gets a peer's code plus what
     the verifier said, and returns a better whole file."""
     parts = [
@@ -105,6 +125,8 @@ def build_critique_prompt(task_description: str, filename: str, code: str,
     ]
     if verifier_notes:
         parts += ["VERIFIER SAID:", verifier_notes[:2000], ""]
+    if peer_reviews:
+        parts += ["PEER REVIEW SAID:", peer_reviews[:3000], ""]
     if human_notes:
         parts += ["THE HUMAN PLAYTESTED IT AND SAID:",
                   human_notes[:2000],

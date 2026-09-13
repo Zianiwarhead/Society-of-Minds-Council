@@ -64,6 +64,9 @@ def test_council_revision_wins(tmp_path, monkeypatch):
 
     def fake_safe_call(model, prompt, timeout_seconds=180):
         calls["n"] += 1
+        if "REVIEW a peer" in prompt:
+            return ExecutorResult(model.id, "The code looks buggy, fix the loop.",
+                                  5, 5, 0.5)
         if "peer model wrote" in prompt:
             # revise round: proper file
             return ExecutorResult(model.id, "```python\nprint('fixed')\n```",
@@ -74,11 +77,13 @@ def test_council_revision_wins(tmp_path, monkeypatch):
     with mock.patch("council.collab._executor.safe_call", side_effect=fake_safe_call):
         report = run_council(models, "game.py", "write a game", proj,
                              _config(), "create-prompt")
-    assert calls["n"] == 4  # 2 writes + 2 revisions
+    assert calls["n"] == 6  # 2 writes + 2 reviews + 2 revisions
     assert any(r.verdict == "PASS" for r in report.rows)
     assert all("(rev)" in r.model_id for r in report.rows)
     assert "phase1-free-a" in report.raw_responses
     assert "phase2-free-a" in report.raw_responses
+    assert "review-free-a-on-free-b" in report.raw_responses
+    assert "review-free-b-on-free-a" in report.raw_responses
 
 
 def test_council_passes_human_notes_to_revise_round(tmp_path, monkeypatch):
@@ -88,6 +93,8 @@ def test_council_passes_human_notes_to_revise_round(tmp_path, monkeypatch):
 
     def fake_safe_call(model, prompt, timeout_seconds=180):
         seen_prompts.append(prompt)
+        if "REVIEW a peer" in prompt:
+            return ExecutorResult(model.id, "fine, keep it.", 1, 1, 0.1)
         return ExecutorResult(model.id, "```python\nx = 1\n```", 1, 1, 0.1)
 
     with mock.patch("council.collab._executor.safe_call", side_effect=fake_safe_call):
@@ -117,6 +124,8 @@ def test_write_council_report_goes_to_councils(tmp_path, monkeypatch):
     proj = _project(tmp_path)
 
     def fake_safe_call(model, prompt, timeout_seconds=180):
+        if "REVIEW a peer" in prompt:
+            return ExecutorResult(model.id, "looks good.", 1, 1, 0.1)
         return ExecutorResult(model.id, "```python\nx = 1\n```", 1, 1, 0.1)
 
     with mock.patch("council.collab._executor.safe_call", side_effect=fake_safe_call):
@@ -125,3 +134,23 @@ def test_write_council_report_goes_to_councils(tmp_path, monkeypatch):
     outdir = write_council_report(proj, report)
     assert outdir.parent.name == "councils"
     assert (outdir / "summary.md").exists()
+
+
+def test_revise_round_feeds_peer_reviews(tmp_path, monkeypatch):
+    from council.collab import run_revise_round
+    reg = _registry(tmp_path, monkeypatch)
+    proj = _project(tmp_path)
+    seen = []
+
+    def fake_safe_call(model, prompt, timeout_seconds=180):
+        seen.append(prompt)
+        return ExecutorResult(model.id, "```python\ny = 2\n```", 1, 1, 0.1)
+
+    models = [reg.get("free-a")]
+    with mock.patch("council.collab._executor.safe_call", side_effect=fake_safe_call):
+        rows, new_codes = run_revise_round(
+            models, {"free-a": "x = 1"}, {"free-a": ["fix the loop"]},
+            "game.py", "write", proj, _config(), round_tag="r1")
+    assert rows[0].verdict == "PASS"
+    assert new_codes["free-a"] == "y = 2"
+    assert any("fix the loop" in p for p in seen)

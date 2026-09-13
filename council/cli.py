@@ -266,6 +266,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Your playtest notes (plain text). Fed to the revise round as "
              "human judgment the verifier can't provide.",
     )
+    collab.add_argument(
+        "--interactive",
+        action="store_true",
+        help="After the scoreboard, direct extra revise rounds yourself: "
+             "type notes, the council revises, repeat. Empty line = done.",
+    )
 
     return parser
 
@@ -692,6 +698,33 @@ def _cmd_collab(args: argparse.Namespace) -> int:
 
     _print_scoreboard(report)
     print(f"\nreport: {outdir}")
+
+    if getattr(args, "interactive", False):
+        from council.collab import MAX_INTERACTIVE_ROUNDS, run_revise_round
+        codes = dict(report.codes)
+        for round_no in range(1, MAX_INTERACTIVE_ROUNDS + 1):
+            try:
+                notes = input(
+                    f"\nDirect the council, round {round_no} "
+                    f"(empty = done, games at {outdir}):\n> "
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if not notes:
+                break
+            rows, codes = run_revise_round(
+                pool, codes, {}, filename, args.task, project_dir, config,
+                human_notes=notes, timeout_seconds=args.timeout,
+                round_tag=f"you-round{round_no}", report=report)
+            if any(r.verdict == "PASS" for r in rows):
+                for r in rows:
+                    r.model_id = f"{r.model_id} (you{round_no})"
+                report.rows = rows
+            outdir = write_council_report(project_dir, report)
+            _print_scoreboard(report)
+            print(f"\nreport: {outdir}")
+
     return 0 if any(r.verdict == "PASS" for r in report.rows) else 1
 
 
