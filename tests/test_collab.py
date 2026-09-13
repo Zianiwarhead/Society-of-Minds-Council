@@ -62,7 +62,7 @@ def test_council_revision_wins(tmp_path, monkeypatch):
     models = [reg.get("free-a"), reg.get("free-b")]
     calls = {"n": 0}
 
-    def fake_safe_call(model, prompt, timeout_seconds=180):
+    def fake_safe_call(model, prompt, timeout_seconds=180, workdir=None):
         calls["n"] += 1
         if "REVIEW a peer" in prompt:
             return ExecutorResult(model.id, "The code looks buggy, fix the loop.",
@@ -91,7 +91,7 @@ def test_council_passes_human_notes_to_revise_round(tmp_path, monkeypatch):
     proj = _project(tmp_path)
     seen_prompts = []
 
-    def fake_safe_call(model, prompt, timeout_seconds=180):
+    def fake_safe_call(model, prompt, timeout_seconds=180, workdir=None):
         seen_prompts.append(prompt)
         if "REVIEW a peer" in prompt:
             return ExecutorResult(model.id, "fine, keep it.", 1, 1, 0.1)
@@ -109,7 +109,7 @@ def test_council_stops_when_nothing_to_build_on(tmp_path, monkeypatch):
     reg = _registry(tmp_path, monkeypatch)
     proj = _project(tmp_path)
 
-    def fake_safe_call(model, prompt, timeout_seconds=180):
+    def fake_safe_call(model, prompt, timeout_seconds=180, workdir=None):
         return ExecutorResult(model.id, "", error="429 nope")
 
     with mock.patch("council.collab._executor.safe_call", side_effect=fake_safe_call):
@@ -123,7 +123,7 @@ def test_write_council_report_goes_to_councils(tmp_path, monkeypatch):
     reg = _registry(tmp_path, monkeypatch)
     proj = _project(tmp_path)
 
-    def fake_safe_call(model, prompt, timeout_seconds=180):
+    def fake_safe_call(model, prompt, timeout_seconds=180, workdir=None):
         if "REVIEW a peer" in prompt:
             return ExecutorResult(model.id, "looks good.", 1, 1, 0.1)
         return ExecutorResult(model.id, "```python\nx = 1\n```", 1, 1, 0.1)
@@ -142,7 +142,7 @@ def test_revise_round_feeds_peer_reviews(tmp_path, monkeypatch):
     proj = _project(tmp_path)
     seen = []
 
-    def fake_safe_call(model, prompt, timeout_seconds=180):
+    def fake_safe_call(model, prompt, timeout_seconds=180, workdir=None):
         seen.append(prompt)
         return ExecutorResult(model.id, "```python\ny = 2\n```", 1, 1, 0.1)
 
@@ -154,3 +154,33 @@ def test_revise_round_feeds_peer_reviews(tmp_path, monkeypatch):
     assert rows[0].verdict == "PASS"
     assert new_codes["free-a"] == "y = 2"
     assert any("fix the loop" in p for p in seen)
+
+
+def test_max_reviewers_caps_critics(tmp_path, monkeypatch):
+    from council.collab import run_council
+    monkeypatch.setenv("OPENROUTER_API_KEY", "x")
+    p = tmp_path / "models.yaml"
+    p.write_text(yaml.safe_dump([
+        {"id": f"m{i}", "provider": "openrouter",
+         "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+         "api_key_env": "OPENROUTER_API_KEY", "cost_tier": "free",
+         "capabilities": ["code_generation"],
+         "quality_score": {"value": 0.1 * i, "source": "user_override"}}
+        for i in range(4)
+    ]))
+    reg = load_registry(p)
+    proj = _project(tmp_path)
+    models = [reg.get(f"m{i}") for i in range(4)]
+    review_calls = []
+
+    def fake(model, prompt, timeout_seconds=180, workdir=None):
+        if "REVIEW a peer" in prompt:
+            review_calls.append(model.id)
+            return ExecutorResult(model.id, "1. x — y — fix it.", 1, 1, 0.1)
+        return ExecutorResult(model.id, "```python\nx = 1\n```", 1, 1, 0.1)
+
+    with mock.patch("council.collab._executor.safe_call", side_effect=fake):
+        run_council(models, "game.py", "write", proj, _config(), "p",
+                    max_reviewers=1)
+    # 4 authors x 1 reviewer each
+    assert len(review_calls) == 4

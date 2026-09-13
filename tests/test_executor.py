@@ -170,7 +170,8 @@ def test_build_review_prompt_names_peer_and_code():
     assert "REVIEW a peer" in prompt
     assert "free-b" in prompt
     assert "print(1)" in prompt
-    assert "Do NOT write code" in prompt
+    assert "numbered" in prompt
+    assert "corrections only" in prompt
 
 
 def test_build_critique_prompt_carries_peer_reviews():
@@ -178,3 +179,68 @@ def test_build_critique_prompt_carries_peer_reviews():
     prompt = build_critique_prompt("t", "g.py", "code", peer_reviews="fix loop")
     assert "PEER REVIEW SAID" in prompt
     assert "fix loop" in prompt
+
+
+def test_build_critique_prompt_demands_disposition():
+    from council.executor import build_critique_prompt
+    prompt = build_critique_prompt("t", "g.py", "code")
+    assert "FIXED" in prompt and "KEPT" in prompt
+
+
+def _opencode_model(**overrides) -> ModelEntry:
+    base = dict(
+        id="ocMind", provider="opencode", endpoint="anthropic/claude-sonnet-4-5",
+        api_key_env="none", cost_tier="free", capabilities=["code_generation"],
+        backend="opencode",
+    )
+    base.update(overrides)
+    return ModelEntry(**base)
+
+
+def test_opencode_routes_by_backend(monkeypatch):
+    from council import executor as ex_mod
+    monkeypatch.setattr(ex_mod.shutil, "which", lambda _: "/usr/bin/opencode")
+    with mock.patch.object(ex_mod.subprocess, "run") as run:
+        proc = mock.MagicMock()
+        proc.returncode = 0
+        proc.stdout = '```python\nprint(1)\n```'
+        proc.stderr = ""
+        run.return_value = proc
+        result = ex_mod.call_model(_opencode_model(), "write x", timeout_seconds=5)
+    assert result.ok
+    assert "print(1)" in result.text
+    cmd = run.call_args[0][0]
+    assert cmd[:4] == ["opencode", "run", "--model", "anthropic/claude-sonnet-4-5"]
+
+
+def test_opencode_missing_binary(monkeypatch):
+    from council import executor as ex_mod
+    monkeypatch.setattr(ex_mod.shutil, "which", lambda _: None)
+    with pytest.raises(ExecutorError, match="opencode CLI on PATH"):
+        ex_mod.call_model(_opencode_model(), "write x")
+
+
+def test_opencode_nonzero_exit_is_error(monkeypatch):
+    from council import executor as ex_mod
+    monkeypatch.setattr(ex_mod.shutil, "which", lambda _: "/usr/bin/opencode")
+    with mock.patch.object(ex_mod.subprocess, "run") as run:
+        proc = mock.MagicMock()
+        proc.returncode = 1
+        proc.stdout = ""
+        proc.stderr = "Error: rate limited"
+        run.return_value = proc
+        with pytest.raises(ExecutorError, match="rate limited"):
+            ex_mod.call_model(_opencode_model(), "write x")
+
+
+def test_parse_opencode_json_events():
+    from council.executor import _parse_opencode_output
+    events = '\n'.join([
+        json.dumps({"type": "step", "text": "thinking out loud here okay!"}),
+        json.dumps({"type": "text", "text": "```python\nprint(1)\n```"}),
+    ])
+    out = _parse_opencode_output(events)
+    assert "print(1)" in out
+    # raw non-JSON falls through untouched
+    assert _parse_opencode_output("```python\nx=1\n```") == "```python\nx=1\n```"
+    assert _parse_opencode_output("   ") == ""

@@ -87,21 +87,35 @@ def _row_for(model: ModelEntry, res, filename: str, project_dir: Path,
 
 
 def _fan_out(models: List[ModelEntry], prompts: Dict[str, str],
-             timeout_seconds: int, max_workers: int):
+             timeout_seconds: int, max_workers: int,
+             workdir: Optional[Path] = None):
     """One parallel call per model. Returns [(model, result)]."""
     workers = max(1, min(len(models), max_workers))
 
     def _call(m: ModelEntry):
-        return m, _executor.safe_call(m, prompts[m.id], timeout_seconds)
+        return m, _executor.safe_call(m, prompts[m.id], timeout_seconds,
+                                      workdir=workdir)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         return list(pool.map(_call, models))
 
 
+def _reviewer_order(models: List[ModelEntry], author_id: str) -> List[ModelEntry]:
+    """Peers who may review this author's code, best-ranked first so a
+    reviewer cap keeps the strongest critics, not arbitrary ones."""
+    peers = [m for m in models if m.id != author_id]
+    peers.sort(key=lambda m: (
+        m.quality_score.value if m.quality_score.value is not None else -1,
+        -m.cost_per_1k_input,
+    ), reverse=True)
+    return peers
+
+
 def run_council(models: List[ModelEntry], filename: str, task_description: str,
                project_dir: Path, config: CouncilConfig,
                create_prompt: str, timeout_seconds: int = 180,
-               max_workers: int = 4, human_notes: str = "") -> CompareReport:
+               max_workers: int = 4, human_notes: str = "",
+               max_reviewers: int = 0) -> CompareReport:
     compare_id = (datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
                   + "-council-" + uuid4().hex[:6])
     report = CompareReport(compare_id=compare_id, task_description=task_description)
@@ -110,7 +124,7 @@ def run_council(models: List[ModelEntry], filename: str, task_description: str,
     codes: Dict[str, str] = {}
     for model, res in _fan_out(
             models, {m.id: create_prompt for m in models},
-            timeout_seconds, max_workers):
+            timeout_seconds, max_workers, workdir=project_dir):
         report.raw_responses[f"phase1-{model.id}"] = res.text if res.ok else ""
         if res.ok:
             report.raw_responses[model.id] = res.text
@@ -121,14 +135,17 @@ def run_council(models: List[ModelEntry], filename: str, task_description: str,
     if not codes:
         return report
 
-    # ---- Phase 2: peer review exchange ----
+    # ---- Phase 2: peer review exchange (best critics first, capped) ----
     reviews: Dict[str, List[str]] = {m.id: [] for m in models}
     if len(models) > 1:
         jobs: Dict[str, str] = {}  # "critic\x00author" -> review prompt
-        for critic in models:
-            for author in models:
-                if critic.id == author.id or author.id not in codes:
-                    continue
+        for author in models:
+            if author.id not in codes:
+                continue
+            critics = _reviewer_order(models, author.id)
+            if max_reviewers > 0:
+                critics = critics[:max_reviewers]
+            for critic in critics:
                 jobs[f"{critic.id}\x00{author.id}"] = (
                     _executor.build_review_prompt(
                         task_description, filename,
@@ -193,7 +210,8 @@ def run_revise_round(models: List[ModelEntry], codes: Dict[str, str],
     revisers = [m for m in models if m.id in prompts]
     rows: List[CompareRow] = []
     new_codes = dict(codes)
-    for model, res in _fan_out(revisers, prompts, timeout_seconds, max_workers):
+    for model, res in _fan_out(revisers, prompts, timeout_seconds,
+                               max_workers, workdir=project_dir):
         if report is not None:
             tag = f"{round_tag}-{model.id}"
             report.raw_responses[tag] = res.text if res.ok else ""

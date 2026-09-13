@@ -15,6 +15,7 @@ from typing import Dict, List, Optional
 import yaml
 
 VALID_COST_TIERS = {"free", "paid", "hybrid"}
+VALID_BACKENDS = {"openrouter", "opencode"}
 VALID_QUALITY_SOURCES = {"user_override", "measured"}  # no scraper/judge — manual only (Section 8)
 REQUIRED_FIELDS = ("id", "provider", "endpoint", "api_key_env", "cost_tier", "capabilities")
 
@@ -49,11 +50,18 @@ class ModelEntry:
     max_concurrent: Optional[int] = None
     escalates_to: Optional[str] = None
     last_verified: Optional[str] = None
+    backend: str = "openrouter"         # openrouter | opencode
 
     def has_api_key(self) -> bool:
         """Whether this model's key is actually set in the environment — the
         fail-fast check from Section 5. Doesn't read the value, just checks
-        presence, so a key is never logged or echoed anywhere."""
+        presence, so a key is never logged or echoed anywhere.
+
+        Local backends (opencode CLI, which owns its own auth) set
+        `api_key_env: "none"` and are always available.
+        """
+        if self.api_key_env.strip().lower() in ("", "none", "-"):
+            return True
         return bool(os.environ.get(self.api_key_env))
 
 
@@ -129,6 +137,13 @@ def _parse_entry(raw: dict) -> ModelEntry:
             f"— must be one of {sorted(VALID_COST_TIERS)}"
         )
 
+    backend = raw.get("backend", "openrouter")
+    if backend not in VALID_BACKENDS:
+        raise RegistryError(
+            f"model '{raw['id']}' has invalid backend '{backend}' "
+            f"— must be one of {sorted(VALID_BACKENDS)}"
+        )
+
     return ModelEntry(
         id=raw["id"],
         provider=raw["provider"],
@@ -146,6 +161,7 @@ def _parse_entry(raw: dict) -> ModelEntry:
         max_concurrent=raw.get("max_concurrent"),
         escalates_to=raw.get("escalates_to"),
         last_verified=raw.get("last_verified"),
+        backend=backend,
     )
 
 

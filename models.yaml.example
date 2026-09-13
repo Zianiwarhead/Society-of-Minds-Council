@@ -34,3 +34,17 @@
   capabilities: ["code_generation", "refactor_simple", "cross_file_architecture", "security_audit"]
   cost_per_1k_input: 3.0
   cost_per_1k_output: 15.0
+
+# OpenCode backend: any model opencode knows becomes a council mind.
+# `endpoint` holds the opencode model id (provider/model); auth is
+# opencode's own business, so api_key_env is "none".
+- id: "opencode-sonnet"
+  provider: "opencode"
+  endpoint: "anthropic/claude-sonnet-4-5"
+  api_key_env: "none"
+  backend: "opencode"
+  cost_tier: "paid"
+  capabilities: ["code_generation", "cross_file_architecture", "security_audit"]
+  quality_score:
+    value: null
+    source: null

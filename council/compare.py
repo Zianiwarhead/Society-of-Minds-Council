@@ -175,7 +175,8 @@ def run_create(models: List[ModelEntry], filename: str, task_description: str,
     workers = max(1, min(len(models), max_workers))
 
     def _call(m: ModelEntry):
-        return m, _executor.safe_call(m, prompt, timeout_seconds)
+        return m, _executor.safe_call(m, prompt, timeout_seconds,
+                                          workdir=project_dir)
 
     calls: Dict[str, object] = {}
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -237,7 +238,8 @@ def run_compare(models: List[ModelEntry], task: Task, project_dir: Path,
     # Parallel fan-out for the network-bound calls, then apply + verify
     # each response in an isolated temp copy (CPU-bound, fast).
     def _call(m: ModelEntry):
-        return m, _executor.safe_call(m, prompt, timeout_seconds)
+        return m, _executor.safe_call(m, prompt, timeout_seconds,
+                                          workdir=project_dir)
 
     calls: Dict[str, object] = {}
     with ThreadPoolExecutor(max_workers=workers) as pool:

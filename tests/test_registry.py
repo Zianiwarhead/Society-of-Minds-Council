@@ -116,3 +116,21 @@ def test_unknown_model_id_raises(tmp_path):
     reg = load_registry(p)
     with pytest.raises(RegistryError, match="no model registered"):
         reg.get("ghost")
+
+
+def test_keyless_local_backend_always_available(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    p = _write_models(tmp_path, [
+        _entry("local-mind", provider="opencode", endpoint="anthropic/claude-sonnet-4-5",
+               api_key_env="none", backend="opencode"),
+    ])
+    reg = load_registry(p)
+    assert reg.get("local-mind").backend == "opencode"
+    assert [m.id for m in reg.available()] == ["local-mind"]
+    assert reg.missing_keys() == []
+
+
+def test_invalid_backend_rejected(tmp_path):
+    p = _write_models(tmp_path, [_entry("m", backend="telepathy")])
+    with pytest.raises(RegistryError, match="backend"):
+        load_registry(p)

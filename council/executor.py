@@ -1,8 +1,10 @@
-"""Model executor — one OpenRouter Chat Completions client (stdlib only).
+"""Model executor — OpenRouter HTTPS client + OpenCode CLI backend.
 
-v1 scope: OpenRouter only. One HTTPS endpoint covers most free + paid
-models, so a single client unblocks the bake-off without a per-provider
-zoo. Other providers (direct Anthropic/OpenAI, local) stay future work.
+Two backends, routed per model (`backend: openrouter | opencode`):
+- openrouter: one HTTPS endpoint covers most free + paid models.
+- opencode: shells out to `opencode run -m <provider/model>`. Auth is
+  opencode's own business (its auth.json/env); the council never sees
+  those keys. Any model opencode knows becomes a council mind.
 
 Keys come from the environment via `model.api_key_env` — never logged,
 never written to disk, never passed into the verifier sandbox.
@@ -11,10 +13,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional
 
 
@@ -89,17 +94,19 @@ def build_create_prompt(task_description: str, filename: str) -> str:
 
 def build_review_prompt(task_description: str, filename: str, peer_code: str,
                         author_id: str) -> str:
-    """Ask one model to REVIEW a peer's code in prose (no code output).
-    The prose goes back to the author for the revise round."""
+    """Ask one model to REVIEW a peer's code as numbered corrections.
+    The author must answer each one in the revise round — correct it or
+    justify keeping it — so reviews become corrections, not ambiance."""
     return "\n".join([
         f"TASK: {task_description}",
         "",
         f"REVIEW a peer's solution ({filename}, written by {author_id}).",
-        "Reply in plain prose, short and specific:",
-        "1. Bugs or edge cases you can spot.",
-        "2. What is good and should be kept.",
-        "3. The single most valuable improvement.",
-        "Do NOT write code — words only, under 20 lines.",
+        "Reply ONLY with a numbered list of concrete corrections:",
+        "1. <file line or function> — <what is wrong> — <how to fix it>",
+        "2. ...",
+        "Rules: be specific and actionable. If something is good, say so in",
+        "one line at the end under KEEP:. No code blocks, no rewrite —",
+        "corrections only, the author applies them.",
         "",
         f"--- {author_id}'s {filename} ---",
         peer_code[:20000],
@@ -121,6 +128,11 @@ def build_critique_prompt(task_description: str, filename: str, code: str,
         "",
         f"--- current {filename} ---",
         code[:20000],
+        "",
+        "First, answer every numbered correction from the peer review,",
+        "one per line: `FIXED: <n>` or `KEPT: <n> because <reason>`.",
+        "Then output the full file. A correction you silently ignore is",
+        "a bug you chose to keep.",
         "",
     ]
     if verifier_notes:
@@ -193,14 +205,21 @@ def _is_transient(exc: BaseException) -> bool:
 
 
 def call_model(model, prompt: str, timeout_seconds: int = 120,
-               retries: int = 1) -> ExecutorResult:
-    """POST one chat completion via the model's endpoint. `model.endpoint`
-    is the full chat-completions URL; `model.id` is the OpenRouter model id.
-
-    Transient failures (dropped connection, timeout, 429/5xx) are retried
-    once after a short wait — free endpoints flake constantly and a single
-    retry saves whole bake-offs.
+               retries: int = 1,
+               workdir: Optional[Path] = None) -> ExecutorResult:
+    """Run one model call via the model's backend (openrouter HTTPS or
+    `opencode run`). Transient failures retry once; anything definitive
+    fails fast.
     """
+    if getattr(model, "backend", "openrouter") == "opencode":
+        return call_opencode(model, prompt, timeout_seconds, retries, workdir)
+    return call_openrouter(model, prompt, timeout_seconds, retries)
+
+
+def call_openrouter(model, prompt: str, timeout_seconds: int = 120,
+                    retries: int = 1) -> ExecutorResult:
+    """POST one chat completion. `model.endpoint` is the full
+    chat-completions URL; `model.id` is the OpenRouter model id."""
     from council.registry import ModelEntry  # local import: keeps module import-light
 
     assert isinstance(model, ModelEntry)
@@ -275,12 +294,121 @@ def call_model(model, prompt: str, timeout_seconds: int = 120,
     )
 
 
-def safe_call(model, prompt: str, timeout_seconds: int = 120) -> ExecutorResult:
+def _collect_text_nodes(node, out: List[str]) -> None:
+    """Best-effort harvest of assistant text from `opencode run --format
+    json` events. Schema may drift across versions, so this gathers every
+    string under text-ish keys instead of trusting one exact shape."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in ("text", "content", "message", "output", "result"):
+                if isinstance(value, str) and value.strip():
+                    out.append(value)
+                else:
+                    _collect_text_nodes(value, out)
+            elif isinstance(value, (dict, list)):
+                _collect_text_nodes(value, out)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_text_nodes(item, out)
+
+
+def _parse_opencode_output(stdout: str) -> str:
+    """Extract the agent's answer from `--format json` output. Falls back
+    to raw stdout — fenced code blocks survive either way, which is all
+    the harness strictly needs."""
+    text = stdout.strip()
+    if not text:
+        return ""
+    events: List[object] = []
+    try:
+        events.append(json.loads(text))
+    except ValueError:
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except ValueError:
+                continue
+    if not events:
+        return text  # not JSON at all — treat the whole thing as the answer
+    found: List[str] = []
+    for event in events:
+        _collect_text_nodes(event, found)
+    # Drop echoes of our own prompt (some formats repeat the input).
+    found = [t for t in found if len(t) > 20]
+    return "\n\n".join(found).strip() or text
+
+
+def call_opencode(model, prompt: str, timeout_seconds: int = 180,
+                  retries: int = 1,
+                  workdir: Optional[Path] = None) -> ExecutorResult:
+    """Run one prompt through `opencode run -m <provider/model>`.
+
+    For opencode-backend entries, `model.endpoint` holds the opencode
+    model id (`provider/model`); auth is opencode's own business.
+    """
+    from council.registry import ModelEntry
+
+    assert isinstance(model, ModelEntry)
+    if shutil.which("opencode") is None:
+        raise ExecutorError(
+            f"model '{model.id}' needs the opencode CLI on PATH "
+            f"(backend: opencode) — install it or drop this mind"
+        )
+    opencode_model = (model.endpoint or "").strip()
+    if not opencode_model or opencode_model.startswith("http"):
+        raise ExecutorError(
+            f"model '{model.id}' has backend opencode but no opencode model id "
+            f"in `endpoint` (want `provider/model`, e.g. anthropic/claude-sonnet-4-5)"
+        )
+    cmd = ["opencode", "run", "--model", opencode_model, "--format", "json", prompt]
+    started = time.monotonic()
+    attempt = 0
+    while True:
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=workdir,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+            break
+        except subprocess.TimeoutExpired as exc:
+            if attempt < retries:
+                attempt += 1
+                time.sleep(RETRY_DELAY_SECONDS)
+                continue
+            raise ExecutorError(
+                f"model '{model.id}' (opencode) timed out after {timeout_seconds}s"
+            ) from exc
+        except OSError as exc:
+            if attempt < retries:
+                attempt += 1
+                time.sleep(RETRY_DELAY_SECONDS)
+                continue
+            raise ExecutorError(
+                f"model '{model.id}' (opencode) failed to launch: {exc}") from exc
+    latency = time.monotonic() - started
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "unknown error").strip()[:500]
+        raise ExecutorError(f"model '{model.id}' (opencode) exited {proc.returncode}: {err}")
+    text = _parse_opencode_output(proc.stdout or "")
+    if not text:
+        raise ExecutorError(
+            f"model '{model.id}' (opencode) returned no usable text")
+    return ExecutorResult(model_id=model.id, text=text, latency_seconds=latency)
+
+
+def safe_call(model, prompt: str, timeout_seconds: int = 120,
+              workdir: Optional[Path] = None) -> ExecutorResult:
     """Like `call_model` but returns a failed result instead of raising —
     the compare harness must record per-model failures, not abort."""
     started = time.monotonic()
     try:
-        return call_model(model, prompt, timeout_seconds)
+        return call_model(model, prompt, timeout_seconds, workdir=workdir)
     except ExecutorError as exc:
         return ExecutorResult(model_id=model.id, text="", error=str(exc),
                               latency_seconds=time.monotonic() - started)

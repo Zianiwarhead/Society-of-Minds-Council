@@ -78,7 +78,7 @@ def test_compare_pass_and_no_diff(tmp_path, monkeypatch):
     models = [reg.get("free-a"), reg.get("free-b")]
     good_diff = ("```diff\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-print(1)\n+print(2)\n```")
 
-    def fake_safe_call(model, prompt, timeout_seconds=120):
+    def fake_safe_call(model, prompt, timeout_seconds=120, workdir=None):
         if model.id == "free-a":
             return ExecutorResult(model.id, good_diff, 10, 5, 0.5)
         return ExecutorResult(model.id, "looks fine to me, no changes needed", 10, 5, 0.4)
@@ -95,7 +95,7 @@ def test_compare_call_failure_recorded(tmp_path, monkeypatch):
     reg = _registry(tmp_path, monkeypatch)
     proj = _project(tmp_path)
 
-    def fake_safe_call(model, prompt, timeout_seconds=120):
+    def fake_safe_call(model, prompt, timeout_seconds=120, workdir=None):
         return ExecutorResult(model.id, "", error="boom: 429 rate limited")
 
     with mock.patch("council.compare._executor.safe_call", side_effect=fake_safe_call):
@@ -109,7 +109,7 @@ def test_compare_does_not_touch_working_tree(tmp_path, monkeypatch):
     before = (proj / "a.py").read_text()
     good_diff = ("```diff\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-print(1)\n+print(2)\n```")
 
-    def fake_safe_call(model, prompt, timeout_seconds=120):
+    def fake_safe_call(model, prompt, timeout_seconds=120, workdir=None):
         return ExecutorResult(model.id, good_diff, 1, 1, 0.1)
 
     with mock.patch("council.compare._executor.safe_call", side_effect=fake_safe_call):
@@ -121,7 +121,7 @@ def test_write_compare_report(tmp_path, monkeypatch):
     reg = _registry(tmp_path, monkeypatch)
     proj = _project(tmp_path)
 
-    def fake_safe_call(model, prompt, timeout_seconds=120):
+    def fake_safe_call(model, prompt, timeout_seconds=120, workdir=None):
         return ExecutorResult(model.id, "no diff here", 1, 1, 0.1)
 
     with mock.patch("council.compare._executor.safe_call", side_effect=fake_safe_call):
@@ -172,7 +172,7 @@ def test_write_compare_report_is_utf8(tmp_path, monkeypatch):
     reg = _registry(tmp_path, monkeypatch)
     proj = _project(tmp_path)
 
-    def fake_safe_call(model, prompt, timeout_seconds=120):
+    def fake_safe_call(model, prompt, timeout_seconds=120, workdir=None):
         return ExecutorResult(model.id, "em dash: \u2014 and en dash: \u2013",
                               1, 1, 0.1)
 
@@ -195,7 +195,7 @@ def test_run_create_pass_and_no_diff(tmp_path, monkeypatch):
     proj = _project(tmp_path)
     models = [reg.get("free-a"), reg.get("free-b")]
 
-    def fake_safe_call(model, prompt, timeout_seconds=180):
+    def fake_safe_call(model, prompt, timeout_seconds=180, workdir=None):
         if model.id == "free-a":
             return ExecutorResult(model.id, "```python\nprint('hi')\n```", 5, 5, 0.5)
         return ExecutorResult(model.id, "Tetris sounds fun, good luck!", 5, 5, 0.4)
@@ -212,7 +212,7 @@ def test_run_create_failing_verify_is_fail(tmp_path, monkeypatch):
     reg = _registry(tmp_path, monkeypatch)
     proj = _project(tmp_path)
 
-    def fake_safe_call(model, prompt, timeout_seconds=180):
+    def fake_safe_call(model, prompt, timeout_seconds=180, workdir=None):
         return ExecutorResult(model.id, "```python\ndef broken(:\n```", 5, 5, 0.5)
 
     with mock.patch("council.compare._executor.safe_call", side_effect=fake_safe_call):
@@ -225,7 +225,7 @@ def test_run_create_does_not_touch_working_tree(tmp_path, monkeypatch):
     reg = _registry(tmp_path, monkeypatch)
     proj = _project(tmp_path)
 
-    def fake_safe_call(model, prompt, timeout_seconds=180):
+    def fake_safe_call(model, prompt, timeout_seconds=180, workdir=None):
         return ExecutorResult(model.id, "```python\nx = 1\n```", 1, 1, 0.1)
 
     with mock.patch("council.compare._executor.safe_call", side_effect=fake_safe_call):

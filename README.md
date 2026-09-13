@@ -57,6 +57,39 @@ Prints a scoreboard (verdict / latency / tokens / est. cost) and writes
 model's raw response. Verdicts: `PASS` / `FAIL` / `NO_DIFF` (chatted
 instead of diffing) / `CALL_FAIL` / `VERIFY_ERROR`.
 
+## Council mode (`council collab`)
+Minds racing (compare) vs. minds talking (collab):
+
+```
+python -m council.cli collab --create game.py --task "..." --models "a,b" --live
+```
+
+Round 1: everyone writes. Round 2: everyone reviews every peer's code
+as numbered corrections (`review-<critic>-on-<author>.md`). Round 3:
+everyone revises their *own* code, answering each correction
+(`FIXED: <n>` / `KEPT: <n> because ...`). Best verified wins.
+`--max-reviewers N` caps critics per author (pairs scale as N^2);
+`--feedback notes.txt` / `--interactive` put you in the director's chair.
+
+## OpenCode backend
+Any model OpenCode knows can be a council mind — no extra keys, auth
+stays in OpenCode:
+
+```yaml
+- id: "opencode-sonnet"
+  provider: "opencode"
+  endpoint: "anthropic/claude-sonnet-4-5"  # opencode model id
+  api_key_env: "none"                      # opencode owns its auth
+  backend: "opencode"
+  cost_tier: "paid"
+  capabilities: ["code_generation"]
+```
+
+Requires the `opencode` CLI on PATH. The council shells out to
+`opencode run -m <provider/model> --format json` with the project dir
+as cwd, so opencode minds can read your files like any agent session.
+Mix backends freely: `--models "opencode-sonnet,nvidia/nemotron-3.5-lightning:free"`.
+
 ## Registry loader (`council/registry.py`)
 Loads and validates `models.yaml` (see `models.yaml.example`):
 - Required fields, valid `cost_tier` (`free`/`paid`/`hybrid`)

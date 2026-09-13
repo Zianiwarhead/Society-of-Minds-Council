@@ -272,6 +272,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="After the scoreboard, direct extra revise rounds yourself: "
              "type notes, the council revises, repeat. Empty line = done.",
     )
+    collab.add_argument(
+        "--max-reviewers",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Cap reviewers per author (best-ranked first). 0 = every peer "
+             "reviews. Needed past a handful of minds (pairs scale as N^2).",
+    )
 
     return parser
 
@@ -693,7 +701,8 @@ def _cmd_collab(args: argparse.Namespace) -> int:
 
     report = run_council(pool, filename, args.task, project_dir, config,
                          prompt, timeout_seconds=args.timeout,
-                         human_notes=human_notes)
+                         human_notes=human_notes,
+                         max_reviewers=getattr(args, "max_reviewers", 0) or 0)
     outdir = write_council_report(project_dir, report)
 
     _print_scoreboard(report)
