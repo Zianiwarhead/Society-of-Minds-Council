@@ -141,6 +141,89 @@ class CompareReport:
     raw_responses: Dict[str, str] = field(default_factory=dict)
 
 
+def _fresh_copy(project_dir: Path) -> Path:
+    """Copy the project (minus VCS, caches, prior results) into a temp dir
+    the harness may freely write into. The working tree is never touched."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="council-compare-"))
+    for item in project_dir.iterdir():
+        if item.name in (".git", ".council", "__pycache__", ".pytest_cache"):
+            continue
+        dest = tmpdir / item.name
+        try:
+            if item.is_dir():
+                shutil.copytree(item, dest, ignore=shutil.ignore_patterns(
+                    ".git", "__pycache__", ".pytest_cache"))
+            else:
+                shutil.copy2(item, dest)
+        except OSError:
+            continue
+    return tmpdir
+
+
+def run_create(models: List[ModelEntry], filename: str, task_description: str,
+               project_dir: Path, config: CouncilConfig, prompt: str,
+               timeout_seconds: int = 180,
+               max_workers: int = 4) -> CompareReport:
+    """Greenfield bake-off: each model writes a whole file. The file is
+    saved into an isolated temp copy of the project and the verifier runs
+    there (e.g. `python -m py_compile <file>`). A response with no code
+    block is NO_DIFF, not a verifier failure."""
+    compare_id = (datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+                  + "-" + uuid.uuid4().hex[:6])
+    report = CompareReport(compare_id=compare_id, task_description=task_description)
+    workers = max(1, min(len(models), max_workers))
+
+    def _call(m: ModelEntry):
+        return m, _executor.safe_call(m, prompt, timeout_seconds)
+
+    calls: Dict[str, object] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for model, res in pool.map(_call, models):
+            calls[model.id] = (model, res)
+            report.raw_responses[model.id] = res.text if res.ok else ""
+
+    for model in models:
+        _, res = calls[model.id]
+        if not res.ok:
+            report.rows.append(CompareRow(
+                model.id, model.cost_tier, False, False, None, error=res.error))
+            continue
+        code = _executor.extract_code_block(res.text)
+        if not code:
+            report.rows.append(CompareRow(
+                model.id, model.cost_tier, True, False, None,
+                latency_seconds=res.latency_seconds,
+                prompt_tokens=res.prompt_tokens,
+                completion_tokens=res.completion_tokens,
+                est_cost_usd=res.estimated_cost_usd(
+                    model.cost_per_1k_input, model.cost_per_1k_output)))
+            continue
+        tmpdir = _fresh_copy(project_dir)
+        try:
+            target = tmpdir / Path(filename).name  # basename only: never escape tmp
+            target.write_text(code if code.endswith("\n") else code + "\n",
+                              encoding="utf-8")
+            workdir = ((tmpdir / config.working_dir).resolve()
+                       if config.working_dir != "." else tmpdir)
+            vreport = run_verifier(config, workdir)
+            failing = vreport.failing_step()
+            err = None
+            if failing is not None:
+                err = (failing.stderr or failing.stdout or failing.error or "")[:300]
+            report.rows.append(CompareRow(
+                model.id, model.cost_tier, True, True, vreport.overall_pass,
+                verify_error=vreport.verify_error,
+                latency_seconds=res.latency_seconds,
+                prompt_tokens=res.prompt_tokens,
+                completion_tokens=res.completion_tokens,
+                est_cost_usd=res.estimated_cost_usd(
+                    model.cost_per_1k_input, model.cost_per_1k_output),
+                error=err or None))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    return report
+
+
 def run_compare(models: List[ModelEntry], task: Task, project_dir: Path,
                config: CouncilConfig, prompt: str,
                timeout_seconds: int = 120,

@@ -187,6 +187,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Cache dir for the live catalog. Defaults to ~/.cache/council.",
     )
     compare.add_argument(
+        "--create",
+        default=None,
+        metavar="FILE",
+        help="Greenfield mode: models write a whole new FILE (e.g. game.py) "
+             "instead of a diff. The verifier runs against it in isolation.",
+    )
+    compare.add_argument(
         "--timeout",
         type=int,
         default=120,
@@ -459,10 +466,20 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_compare(args: argparse.Namespace) -> int:
-    from council.compare import collect_context, run_compare, write_compare_report
-    from council.executor import build_prompt
+    from council.compare import (
+        collect_context,
+        run_compare,
+        run_create,
+        write_compare_report,
+    )
+    from council.executor import build_create_prompt, build_prompt
 
     project_dir = Path(args.project_dir).resolve()
+
+    if getattr(args, "create", None) and args.path:
+        print("council: give either a target path or --create FILE, not both",
+              file=sys.stderr)
+        return 2
 
     try:
         config = load_config(project_dir)
@@ -501,27 +518,42 @@ def _cmd_compare(args: argparse.Namespace) -> int:
             print(f"council: missing env vars: {missing}", file=sys.stderr)
         return 2
 
-    try:
-        task = build_task(
-            path=args.path, diff_ref=None, description=args.task,
-            verifier_command=config.verify[0].run if config.verify else None,
-            cwd=project_dir,
-        )
-    except IngestionError as exc:
-        print(f"council: {exc}", file=sys.stderr)
-        return 2
+    if getattr(args, "create", None):
+        # Greenfield mode: no target file, models write the whole thing.
+        filename = Path(args.create).name
+        prompt = build_create_prompt(args.task, filename)
+        print(f"Bake-off (create {filename}): {len(pool)} model(s) — '{args.task}'")
+        if live_note:
+            print(f"  registry: {live_note}")
+        print(f"  pool: {', '.join(m.id for m in pool)}")
+        print()
+        report = run_create(pool, filename, args.task, project_dir, config,
+                            prompt, timeout_seconds=args.timeout)
+    else:
+        if not args.path:
+            print("council: give a target path or --create FILE", file=sys.stderr)
+            return 2
+        try:
+            task = build_task(
+                path=args.path, diff_ref=None, description=args.task,
+                verifier_command=config.verify[0].run if config.verify else None,
+                cwd=project_dir,
+            )
+        except IngestionError as exc:
+            print(f"council: {exc}", file=sys.stderr)
+            return 2
 
-    context = collect_context(task, project_dir)
-    prompt = build_prompt(task.description, context)
+        context = collect_context(task, project_dir)
+        prompt = build_prompt(task.description, context)
 
-    print(f"Bake-off: {len(pool)} model(s) — '{task.description}'")
-    if live_note:
-        print(f"  registry: {live_note}")
-    print(f"  pool: {', '.join(m.id for m in pool)}")
-    print()
+        print(f"Bake-off: {len(pool)} model(s) — '{task.description}'")
+        if live_note:
+            print(f"  registry: {live_note}")
+        print(f"  pool: {', '.join(m.id for m in pool)}")
+        print()
 
-    report = run_compare(pool, task, project_dir, config, prompt,
-                         timeout_seconds=args.timeout)
+        report = run_compare(pool, task, project_dir, config, prompt,
+                             timeout_seconds=args.timeout)
     outdir = write_compare_report(project_dir, report)
 
     print(f"{'model':<40} {'tier':<7} {'verdict':<12} {'latency':<8} {'tok in/out':<14} {'est cost'}")

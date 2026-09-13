@@ -11,7 +11,9 @@ import pytest
 from council import executor as ex
 from council.executor import (
     ExecutorError,
+    build_create_prompt,
     build_prompt,
+    extract_code_block,
     extract_diff,
     safe_call,
 )
@@ -98,3 +100,24 @@ def test_safe_call_returns_failed_result(monkeypatch):
     result = safe_call(_model(), "do it")
     assert not result.ok
     assert result.error is not None
+
+
+def test_build_create_prompt_names_file_and_task():
+    prompt = build_create_prompt("write tetris", "game.py")
+    assert "write tetris" in prompt
+    assert "game.py" in prompt
+    assert "standard library" in prompt
+
+
+def test_extract_code_block_prefers_python():
+    text = "here:\n```python\nprint(1)\n```\ndone"
+    assert extract_code_block(text) == "print(1)"
+
+
+def test_extract_code_block_falls_back_to_plain_fence():
+    text = "here:\n```\nx = 1\n```"
+    assert extract_code_block(text) == "x = 1"
+
+
+def test_extract_code_block_none_for_chat():
+    assert extract_code_block("Tetris is a fun game with blocks!") is None

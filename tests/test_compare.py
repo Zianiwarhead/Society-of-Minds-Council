@@ -11,6 +11,7 @@ from council.compare import (
     _normalize_diff_paths,
     collect_context,
     run_compare,
+    run_create,
     write_compare_report,
 )
 from council.config import CouncilConfig, SandboxConfig, VerifyStep
@@ -180,3 +181,54 @@ def test_write_compare_report_is_utf8(tmp_path, monkeypatch):
     outdir = write_compare_report(proj, report)
     raw = (outdir / "free-a.md").read_bytes()
     assert raw.decode("utf-8") == "em dash: \u2014 and en dash: \u2013"
+
+
+def _create_config() -> CouncilConfig:
+    return CouncilConfig(
+        verify=[VerifyStep(name="compiles",
+                           run="python -m py_compile game.py")],
+        sandbox=SandboxConfig(image="python:3.11-slim"))
+
+
+def test_run_create_pass_and_no_diff(tmp_path, monkeypatch):
+    reg = _registry(tmp_path, monkeypatch)
+    proj = _project(tmp_path)
+    models = [reg.get("free-a"), reg.get("free-b")]
+
+    def fake_safe_call(model, prompt, timeout_seconds=180):
+        if model.id == "free-a":
+            return ExecutorResult(model.id, "```python\nprint('hi')\n```", 5, 5, 0.5)
+        return ExecutorResult(model.id, "Tetris sounds fun, good luck!", 5, 5, 0.4)
+
+    with mock.patch("council.compare._executor.safe_call", side_effect=fake_safe_call):
+        report = run_create(models, "game.py", "write a game", proj,
+                            _create_config(), "prompt")
+    by_id = {r.model_id: r for r in report.rows}
+    assert by_id["free-a"].verdict == "PASS"
+    assert by_id["free-b"].verdict == "NO_DIFF"
+
+
+def test_run_create_failing_verify_is_fail(tmp_path, monkeypatch):
+    reg = _registry(tmp_path, monkeypatch)
+    proj = _project(tmp_path)
+
+    def fake_safe_call(model, prompt, timeout_seconds=180):
+        return ExecutorResult(model.id, "```python\ndef broken(:\n```", 5, 5, 0.5)
+
+    with mock.patch("council.compare._executor.safe_call", side_effect=fake_safe_call):
+        report = run_create([reg.get("free-a")], "game.py", "write a game",
+                            proj, _create_config(), "prompt")
+    assert report.rows[0].verdict == "FAIL"
+
+
+def test_run_create_does_not_touch_working_tree(tmp_path, monkeypatch):
+    reg = _registry(tmp_path, monkeypatch)
+    proj = _project(tmp_path)
+
+    def fake_safe_call(model, prompt, timeout_seconds=180):
+        return ExecutorResult(model.id, "```python\nx = 1\n```", 1, 1, 0.1)
+
+    with mock.patch("council.compare._executor.safe_call", side_effect=fake_safe_call):
+        run_create([reg.get("free-a")], "game.py", "write a game",
+                   proj, _create_config(), "prompt")
+    assert not (proj / "game.py").exists()

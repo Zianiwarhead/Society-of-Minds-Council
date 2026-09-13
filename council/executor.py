@@ -71,6 +71,41 @@ def build_prompt(task_description: str, file_context: Dict[str, str]) -> str:
     return "\n".join(parts)
 
 
+def build_create_prompt(task_description: str, filename: str) -> str:
+    """Assemble a greenfield prompt: the model writes a whole file, not a
+    diff. Output contract is one fenced code block so the harness can save
+    + verify it in isolation."""
+    return "\n".join([
+        f"TASK: {task_description}",
+        "",
+        f"Write a complete, runnable file named {filename}.",
+        "Rules:",
+        "- Use only the Python standard library unless the task says otherwise.",
+        "- The file must parse and import cleanly (it will be checked).",
+        "- Output ONLY the file contents inside a single fenced code block",
+        "  (```python ... ```), no explanation before or after.",
+    ])
+
+
+def extract_code_block(text: str) -> Optional[str]:
+    """Pull the first fenced code block out of a response. Prefers a
+    ```python block, falls back to any fenced block. Returns None if the
+    model chatted instead of writing code."""
+    lower = text.lower()
+    for marker in ("```python", "```py", "```"):
+        start = lower.find(marker)
+        if start == -1:
+            continue
+        body_start = start + len(marker)
+        end = text.find("```", body_start)
+        if end == -1:
+            continue
+        code = text[body_start:end].strip("\n")
+        if code.strip():
+            return code
+    return None
+
+
 def extract_diff(text: str) -> Optional[str]:
     """Pull the first ```diff ... ``` block out of a response. Returns None
     if no fenced block exists (model chatted instead of diffing)."""
