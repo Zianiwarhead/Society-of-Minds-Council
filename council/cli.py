@@ -259,6 +259,13 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="Per-model call timeout. Defaults to 180 (two rounds of long outputs).",
     )
+    collab.add_argument(
+        "--feedback",
+        default=None,
+        metavar="FILE",
+        help="Your playtest notes (plain text). Fed to the revise round as "
+             "human judgment the verifier can't provide.",
+    )
 
     return parser
 
@@ -665,10 +672,22 @@ def _cmd_collab(args: argparse.Namespace) -> int:
         print(f"  registry: {live_note}")
     print(f"  pool: {', '.join(m.id for m in pool)}")
     print("  rounds: write -> critique+revise -> best verified wins")
+    human_notes = ""
+    if getattr(args, "feedback", None):
+        try:
+            human_notes = Path(args.feedback).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            print(f"council: cannot read feedback file: {exc}", file=sys.stderr)
+            return 2
+        if not human_notes:
+            print("council: feedback file is empty", file=sys.stderr)
+            return 2
+        print(f"  human feedback: {args.feedback} ({len(human_notes)} chars)")
     print()
 
     report = run_council(pool, filename, args.task, project_dir, config,
-                         prompt, timeout_seconds=args.timeout)
+                         prompt, timeout_seconds=args.timeout,
+                         human_notes=human_notes)
     outdir = write_council_report(project_dir, report)
 
     _print_scoreboard(report)

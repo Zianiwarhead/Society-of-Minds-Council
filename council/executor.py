@@ -88,7 +88,8 @@ def build_create_prompt(task_description: str, filename: str) -> str:
 
 
 def build_critique_prompt(task_description: str, filename: str, code: str,
-                          verifier_notes: str = "") -> str:
+                          verifier_notes: str = "",
+                          human_notes: str = "") -> str:
     """Assemble the revise round: the model gets a peer's code plus what
     the verifier said, and returns a better whole file."""
     parts = [
@@ -104,6 +105,10 @@ def build_critique_prompt(task_description: str, filename: str, code: str,
     ]
     if verifier_notes:
         parts += ["VERIFIER SAID:", verifier_notes[:2000], ""]
+    if human_notes:
+        parts += ["THE HUMAN PLAYTESTED IT AND SAID:",
+                  human_notes[:2000],
+                  "Address every point. ", ""]
     parts += [
         "Output ONLY the full file inside a single ```python fenced block,",
         "no explanation before or after.",

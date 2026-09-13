@@ -54,7 +54,7 @@ def _verify_code(code: str, filename: str, project_dir: Path,
 def run_council(models: List[ModelEntry], filename: str, task_description: str,
                project_dir: Path, config: CouncilConfig,
                create_prompt: str, timeout_seconds: int = 180,
-               max_workers: int = 4) -> CompareReport:
+               max_workers: int = 4, human_notes: str = "") -> CompareReport:
     compare_id = (datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
                   + "-council-" + uuid4().hex[:6])
     report = CompareReport(compare_id=compare_id, task_description=task_description)
@@ -119,7 +119,7 @@ def run_council(models: List[ModelEntry], filename: str, task_description: str,
     # ---- Phase 2: everyone improves the shared base ----
     def _revise(m: ModelEntry):
         prompt = _executor.build_critique_prompt(
-            task_description, filename, base_code, base_notes)
+            task_description, filename, base_code, base_notes, human_notes)
         return m, _executor.safe_call(m, prompt, timeout_seconds)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:

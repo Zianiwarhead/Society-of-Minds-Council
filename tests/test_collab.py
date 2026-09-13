@@ -49,6 +49,13 @@ def test_critique_prompt_carries_code_and_notes():
     assert "boom" in prompt
 
 
+def test_critique_prompt_carries_human_notes():
+    prompt = build_critique_prompt("write x", "game.py", "print(1)",
+                                   human_notes="pieces fall too fast")
+    assert "pieces fall too fast" in prompt
+    assert "PLAYTESTED" in prompt
+
+
 def test_council_revision_wins(tmp_path, monkeypatch):
     reg = _registry(tmp_path, monkeypatch)
     proj = _project(tmp_path)
@@ -72,6 +79,23 @@ def test_council_revision_wins(tmp_path, monkeypatch):
     assert all("(rev)" in r.model_id for r in report.rows)
     assert "phase1-free-a" in report.raw_responses
     assert "phase2-free-a" in report.raw_responses
+
+
+def test_council_passes_human_notes_to_revise_round(tmp_path, monkeypatch):
+    reg = _registry(tmp_path, monkeypatch)
+    proj = _project(tmp_path)
+    seen_prompts = []
+
+    def fake_safe_call(model, prompt, timeout_seconds=180):
+        seen_prompts.append(prompt)
+        return ExecutorResult(model.id, "```python\nx = 1\n```", 1, 1, 0.1)
+
+    with mock.patch("council.collab._executor.safe_call", side_effect=fake_safe_call):
+        run_council([reg.get("free-a")], "game.py", "write", proj,
+                    _config(), "p", human_notes="too slow, add levels")
+    revise_prompts = [p for p in seen_prompts if "peer model wrote" in p]
+    assert revise_prompts
+    assert all("too slow, add levels" in p for p in revise_prompts)
 
 
 def test_council_stops_when_nothing_to_build_on(tmp_path, monkeypatch):
