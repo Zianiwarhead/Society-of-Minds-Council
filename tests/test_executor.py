@@ -100,6 +100,46 @@ def test_safe_call_returns_failed_result(monkeypatch):
     result = safe_call(_model(), "do it")
     assert not result.ok
     assert result.error is not None
+    assert result.latency_seconds >= 0
+
+
+def test_transient_oserror_retried_once(monkeypatch):
+    monkeypatch.setenv("TEST_COUNCIL_KEY", "k")
+    payload = {"choices": [{"message": {"content": "hi"}}], "usage": {}}
+    with mock.patch.object(ex.urllib.request, "urlopen") as urlopen, \
+         mock.patch.object(ex.json, "load", return_value=payload), \
+         mock.patch.object(ex.time, "sleep") as sleep:
+        resp = mock.MagicMock()
+        resp.__enter__.return_value = resp
+        resp.__exit__.return_value = False
+        urlopen.side_effect = [OSError("conn reset"), resp]
+        result = ex.call_model(_model(), "do it", timeout_seconds=5)
+    assert result.ok
+    assert urlopen.call_count == 2
+    sleep.assert_called_once()
+
+
+def test_non_transient_http_error_not_retried(monkeypatch):
+    monkeypatch.setenv("TEST_COUNCIL_KEY", "k")
+    err = urllib.error.HTTPError(
+        "https://x", 401, "Unauthorized", {}, io.BytesIO(b"bad key"))
+    with mock.patch.object(ex.urllib.request, "urlopen", side_effect=err) as urlopen:
+        with pytest.raises(ExecutorError, match="401"):
+            ex.call_model(_model(), "do it")
+        assert urlopen.call_count == 1
+
+
+def test_unexpected_shape_includes_preview(monkeypatch):
+    monkeypatch.setenv("TEST_COUNCIL_KEY", "k")
+    payload = {"error": {"message": "model overloaded"}}
+    with mock.patch.object(ex.urllib.request, "urlopen") as urlopen, \
+         mock.patch.object(ex.json, "load", return_value=payload):
+        resp = mock.MagicMock()
+        resp.__enter__.return_value = resp
+        resp.__exit__.return_value = False
+        urlopen.return_value = resp
+        with pytest.raises(ExecutorError, match="model overloaded"):
+            ex.call_model(_model(), "do it")
 
 
 def test_build_create_prompt_names_file_and_task():

@@ -152,9 +152,28 @@ def extract_diff(text: str) -> Optional[str]:
     return None
 
 
-def call_model(model, prompt: str, timeout_seconds: int = 120) -> ExecutorResult:
+TRANSIENT_HTTP_CODES = {408, 425, 429, 500, 502, 503, 504}
+RETRY_DELAY_SECONDS = 5
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """Whether a failed call is worth one retry: dropped connections,
+    timeouts, rate limits, and provider 5xx. Auth/validation errors and
+    malformed payloads fail fast instead."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in TRANSIENT_HTTP_CODES
+    return isinstance(exc, (TimeoutError, OSError))
+
+
+def call_model(model, prompt: str, timeout_seconds: int = 120,
+               retries: int = 1) -> ExecutorResult:
     """POST one chat completion via the model's endpoint. `model.endpoint`
-    is the full chat-completions URL; `model.id` is the OpenRouter model id."""
+    is the full chat-completions URL; `model.id` is the OpenRouter model id.
+
+    Transient failures (dropped connection, timeout, 429/5xx) are retried
+    once after a short wait — free endpoints flake constantly and a single
+    retry saves whole bake-offs.
+    """
     from council.registry import ModelEntry  # local import: keeps module import-light
 
     assert isinstance(model, ModelEntry)
@@ -178,29 +197,47 @@ def call_model(model, prompt: str, timeout_seconds: int = 120) -> ExecutorResult
         method="POST",
     )
     started = time.monotonic()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
-            payload = json.load(resp)
-    except urllib.error.HTTPError as exc:
+    attempt = 0
+    while True:
         try:
-            detail = exc.read().decode()[:500]
-        except Exception:
-            detail = ""
-        raise ExecutorError(
-            f"model '{model.id}' HTTP {exc.code}: {detail or exc.reason}"
-        ) from exc
-    except TimeoutError as exc:
-        raise ExecutorError(
-            f"model '{model.id}' timed out after {timeout_seconds}s") from exc
-    except OSError as exc:
-        raise ExecutorError(f"model '{model.id}' request failed: {exc}") from exc
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                payload = json.load(resp)
+            break
+        except Exception as exc:  # noqa: BLE001 — classified below
+            transient = _is_transient(exc)
+            if transient and attempt < retries:
+                attempt += 1
+                time.sleep(RETRY_DELAY_SECONDS)
+                continue
+            if isinstance(exc, urllib.error.HTTPError):
+                try:
+                    detail = exc.read().decode()[:500]
+                except Exception:
+                    detail = ""
+                raise ExecutorError(
+                    f"model '{model.id}' HTTP {exc.code}: {detail or exc.reason}"
+                    + (f" (after {attempt + 1} tries)" if attempt else "")
+                ) from exc
+            if isinstance(exc, TimeoutError):
+                raise ExecutorError(
+                    f"model '{model.id}' timed out after {timeout_seconds}s"
+                    + (f" (after {attempt + 1} tries)" if attempt else "")
+                ) from exc
+            if isinstance(exc, OSError):
+                raise ExecutorError(
+                    f"model '{model.id}' request failed: {exc}"
+                    + (f" (after {attempt + 1} tries)" if attempt else "")
+                ) from exc
+            raise
 
     latency = time.monotonic() - started
     try:
         text = payload["choices"][0]["message"]["content"] or ""
     except (KeyError, IndexError, TypeError) as exc:
+        preview = json.dumps(payload)[:300]
         raise ExecutorError(
-            f"model '{model.id}' returned an unexpected response shape") from exc
+            f"model '{model.id}' returned an unexpected response shape: {preview}"
+        ) from exc
     usage = payload.get("usage", {}) or {}
     return ExecutorResult(
         model_id=model.id,
@@ -214,7 +251,9 @@ def call_model(model, prompt: str, timeout_seconds: int = 120) -> ExecutorResult
 def safe_call(model, prompt: str, timeout_seconds: int = 120) -> ExecutorResult:
     """Like `call_model` but returns a failed result instead of raising —
     the compare harness must record per-model failures, not abort."""
+    started = time.monotonic()
     try:
         return call_model(model, prompt, timeout_seconds)
     except ExecutorError as exc:
-        return ExecutorResult(model_id=model.id, text="", error=str(exc))
+        return ExecutorResult(model_id=model.id, text="", error=str(exc),
+                              latency_seconds=time.monotonic() - started)
