@@ -201,6 +201,65 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Per-model call timeout. Defaults to 120.",
     )
 
+    collab = subparsers.add_parser(
+        "collab",
+        help="Council mode: models write, critique, and revise together.",
+    )
+    collab.add_argument(
+        "--create",
+        required=True,
+        metavar="FILE",
+        help="File the council builds together, e.g. game.py.",
+    )
+    collab.add_argument(
+        "--task",
+        required=True,
+        metavar="DESCRIPTION",
+        help="What the council should build.",
+    )
+    collab.add_argument(
+        "--models",
+        default=None,
+        metavar="IDS",
+        help="Comma-separated model ids. Defaults to all available free-tier models.",
+    )
+    collab.add_argument(
+        "--tier",
+        default="free",
+        choices=["free", "paid", "hybrid", "all"],
+        help="Model pool when --models is omitted. Defaults to free.",
+    )
+    collab.add_argument(
+        "--project-dir",
+        default=".",
+        metavar="PATH",
+        help="Project root containing .council.yaml. Defaults to the current directory.",
+    )
+    collab.add_argument(
+        "--registry",
+        default="models.yaml",
+        metavar="PATH",
+        help="Path to models.yaml. Defaults to ./models.yaml (falls back to <project-dir>/models.yaml).",
+    )
+    collab.add_argument(
+        "--live",
+        action="store_true",
+        help="Merge the cached live catalog (see `models sync`) under models.yaml overrides.",
+    )
+    collab.add_argument(
+        "--cache-dir",
+        default=None,
+        metavar="PATH",
+        help="Cache dir for the live catalog. Defaults to ~/.cache/council.",
+    )
+    collab.add_argument(
+        "--timeout",
+        type=int,
+        default=180,
+        metavar="SECONDS",
+        help="Per-model call timeout. Defaults to 180 (two rounds of long outputs).",
+    )
+
     return parser
 
 
@@ -465,6 +524,65 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 1
 
 
+def _select_pool(registry: ModelRegistry, args: argparse.Namespace) -> tuple[list, Optional[str]]:
+    """Resolve --models / --tier to available models. Returns (pool, error)."""
+    if args.models:
+        wanted = [m.strip() for m in args.models.split(",") if m.strip()]
+        try:
+            return [registry.get(m) for m in wanted], None
+        except RegistryError as exc:
+            return [], str(exc)
+    if args.tier == "all":
+        pool = registry.available()
+    else:
+        pool = registry.available(registry.eligible_for(["code_generation"], cost_tier=args.tier))
+    if not pool:
+        capable = (registry.eligible_for(["code_generation"])
+                   if args.tier in ("all", None) else
+                   registry.eligible_for(["code_generation"], cost_tier=args.tier))
+        missing = registry.missing_keys(capable) if capable else registry.missing_keys()
+        err = f"no available models in pool '{args.tier or args.models}'"
+        if missing:
+            err += f" (missing env vars: {missing})"
+        return [], err
+    return pool, None
+
+
+def _print_scoreboard(report) -> None:
+    print(f"{'model':<40} {'tier':<7} {'verdict':<12} {'latency':<8} {'tok in/out':<14} {'est cost'}")
+    for r in report.rows:
+        print(f"{r.model_id:<40} {r.cost_tier:<7} {r.verdict:<12} "
+              f"{r.latency_seconds:<8.1f} {r.prompt_tokens}/{r.completion_tokens:<11} "
+              f"${r.est_cost_usd:.6f}")
+        if r.error:
+            print(f"    -> {(r.error or '')[:160]}")
+
+
+def _load_config_and_pool(args: argparse.Namespace):
+    """Shared setup for compare/collab. Returns (project_dir, config,
+    pool, live_note) or (None, exit_code) on error."""
+    project_dir = Path(args.project_dir).resolve()
+    try:
+        config = load_config(project_dir)
+    except ConfigError as exc:
+        print(f"council: config error: {exc}", file=sys.stderr)
+        return None, 2
+    try:
+        registry, live_note = _load_registry_for_run(
+            args.registry, project_dir,
+            getattr(args, "live", False),
+            getattr(args, "cache_dir", None),
+        )
+    except (RegistryError, DiscoveryError) as exc:
+        print(f"council: registry error: {exc}", file=sys.stderr)
+        return None, 2
+    pool, err = _select_pool(registry, args)
+    if err:
+        print(f"council: {err}", file=sys.stderr)
+        return None, 2
+    return (project_dir, config, pool, live_note), 0
+
+
 def _cmd_compare(args: argparse.Namespace) -> int:
     from council.compare import (
         collect_context,
@@ -474,48 +592,14 @@ def _cmd_compare(args: argparse.Namespace) -> int:
     )
     from council.executor import build_create_prompt, build_prompt
 
-    project_dir = Path(args.project_dir).resolve()
+    setup, code = _load_config_and_pool(args)
+    if setup is None:
+        return code
+    project_dir, config, pool, live_note = setup
 
     if getattr(args, "create", None) and args.path:
         print("council: give either a target path or --create FILE, not both",
               file=sys.stderr)
-        return 2
-
-    try:
-        config = load_config(project_dir)
-    except ConfigError as exc:
-        print(f"council: config error: {exc}", file=sys.stderr)
-        return 2
-
-    try:
-        registry, live_note = _load_registry_for_run(
-            args.registry, project_dir,
-            getattr(args, "live", False),
-            getattr(args, "cache_dir", None),
-        )
-    except (RegistryError, DiscoveryError) as exc:
-        print(f"council: registry error: {exc}", file=sys.stderr)
-        return 2
-
-    if args.models:
-        wanted = [m.strip() for m in args.models.split(",") if m.strip()]
-        try:
-            pool = [registry.get(m) for m in wanted]
-        except RegistryError as exc:
-            print(f"council: {exc}", file=sys.stderr)
-            return 2
-    elif args.tier == "all":
-        pool = registry.available()
-    else:
-        pool = registry.available(registry.eligible_for(["code_generation"], cost_tier=args.tier))
-    if not pool:
-        capable = (registry.eligible_for(["code_generation"])
-                   if args.tier in ("all", None) else
-                   registry.eligible_for(["code_generation"], cost_tier=args.tier))
-        missing = registry.missing_keys(capable) if capable else registry.missing_keys()
-        print(f"council: no available models in pool '{args.tier or args.models}'", file=sys.stderr)
-        if missing:
-            print(f"council: missing env vars: {missing}", file=sys.stderr)
         return 2
 
     if getattr(args, "create", None):
@@ -556,13 +640,38 @@ def _cmd_compare(args: argparse.Namespace) -> int:
                              timeout_seconds=args.timeout)
     outdir = write_compare_report(project_dir, report)
 
-    print(f"{'model':<40} {'tier':<7} {'verdict':<12} {'latency':<8} {'tok in/out':<14} {'est cost'}")
-    for r in report.rows:
-        print(f"{r.model_id:<40} {r.cost_tier:<7} {r.verdict:<12} "
-              f"{r.latency_seconds:<8.1f} {r.prompt_tokens}/{r.completion_tokens:<11} "
-              f"${r.est_cost_usd:.6f}")
-        if r.error:
-            print(f"    -> {(r.error or '')[:160]}")
+    _print_scoreboard(report)
+    print(f"\nreport: {outdir}")
+    return 0 if any(r.verdict == "PASS" for r in report.rows) else 1
+
+
+def _cmd_collab(args: argparse.Namespace) -> int:
+    from council.collab import run_council, write_council_report
+    from council.executor import build_create_prompt
+
+    setup, code = _load_config_and_pool(args)
+    if setup is None:
+        return code
+    project_dir, config, pool, live_note = setup
+
+    if len(pool) < 1:
+        print("council: collab needs at least one model", file=sys.stderr)
+        return 2
+
+    filename = Path(args.create).name
+    prompt = build_create_prompt(args.task, filename)
+    print(f"Council (create {filename}): {len(pool)} mind(s) — '{args.task}'")
+    if live_note:
+        print(f"  registry: {live_note}")
+    print(f"  pool: {', '.join(m.id for m in pool)}")
+    print("  rounds: write -> critique+revise -> best verified wins")
+    print()
+
+    report = run_council(pool, filename, args.task, project_dir, config,
+                         prompt, timeout_seconds=args.timeout)
+    outdir = write_council_report(project_dir, report)
+
+    _print_scoreboard(report)
     print(f"\nreport: {outdir}")
     return 0 if any(r.verdict == "PASS" for r in report.rows) else 1
 
@@ -577,6 +686,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_models(args)
     if args.command == "compare":
         return _cmd_compare(args)
+    if args.command == "collab":
+        return _cmd_collab(args)
 
     parser.print_help()
     return 1

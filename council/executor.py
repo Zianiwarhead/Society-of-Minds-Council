@@ -87,6 +87,30 @@ def build_create_prompt(task_description: str, filename: str) -> str:
     ])
 
 
+def build_critique_prompt(task_description: str, filename: str, code: str,
+                          verifier_notes: str = "") -> str:
+    """Assemble the revise round: the model gets a peer's code plus what
+    the verifier said, and returns a better whole file."""
+    parts = [
+        f"TASK: {task_description}",
+        "",
+        f"A peer model wrote this {filename}. Improve it — fix bugs,",
+        "handle edge cases, keep what works. Return the COMPLETE improved",
+        "file, not a diff.",
+        "",
+        f"--- current {filename} ---",
+        code[:20000],
+        "",
+    ]
+    if verifier_notes:
+        parts += ["VERIFIER SAID:", verifier_notes[:2000], ""]
+    parts += [
+        "Output ONLY the full file inside a single ```python fenced block,",
+        "no explanation before or after.",
+    ]
+    return "\n".join(parts)
+
+
 def extract_code_block(text: str) -> Optional[str]:
     """Pull the first fenced code block out of a response. Prefers a
     ```python block, falls back to any fenced block. Returns None if the

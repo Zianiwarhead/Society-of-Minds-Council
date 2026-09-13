@@ -1,0 +1,103 @@
+"""Council mode tests — write -> critique -> revise (model calls mocked)."""
+from __future__ import annotations
+
+from pathlib import Path
+from unittest import mock
+
+import yaml
+
+from council.collab import run_council, write_council_report
+from council.compare import CompareReport
+from council.config import CouncilConfig, SandboxConfig, VerifyStep
+from council.executor import ExecutorResult, build_critique_prompt
+from council.registry import load_registry
+
+
+def _registry(tmp_path: Path, monkeypatch) -> object:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "x")
+    p = tmp_path / "models.yaml"
+    p.write_text(yaml.safe_dump([
+        {"id": "free-a", "provider": "openrouter",
+         "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+         "api_key_env": "OPENROUTER_API_KEY", "cost_tier": "free",
+         "capabilities": ["code_generation"]},
+        {"id": "free-b", "provider": "openrouter",
+         "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+         "api_key_env": "OPENROUTER_API_KEY", "cost_tier": "free",
+         "capabilities": ["code_generation"]},
+    ]))
+    return load_registry(p)
+
+
+def _project(tmp_path: Path) -> Path:
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    return proj
+
+
+def _config() -> CouncilConfig:
+    return CouncilConfig(
+        verify=[VerifyStep(name="compiles",
+                           run="python -m py_compile game.py")],
+        sandbox=SandboxConfig(image="python:3.11-slim"))
+
+
+def test_critique_prompt_carries_code_and_notes():
+    prompt = build_critique_prompt("write x", "game.py", "print(1)", "boom")
+    assert "write x" in prompt
+    assert "print(1)" in prompt
+    assert "boom" in prompt
+
+
+def test_council_revision_wins(tmp_path, monkeypatch):
+    reg = _registry(tmp_path, monkeypatch)
+    proj = _project(tmp_path)
+    models = [reg.get("free-a"), reg.get("free-b")]
+    calls = {"n": 0}
+
+    def fake_safe_call(model, prompt, timeout_seconds=180):
+        calls["n"] += 1
+        if "peer model wrote" in prompt:
+            # revise round: proper file
+            return ExecutorResult(model.id, "```python\nprint('fixed')\n```",
+                                  5, 5, 0.5)
+        # write round: broken file
+        return ExecutorResult(model.id, "```python\ndef broken(:\n```", 5, 5, 0.5)
+
+    with mock.patch("council.collab._executor.safe_call", side_effect=fake_safe_call):
+        report = run_council(models, "game.py", "write a game", proj,
+                             _config(), "create-prompt")
+    assert calls["n"] == 4  # 2 writes + 2 revisions
+    assert any(r.verdict == "PASS" for r in report.rows)
+    assert all("(rev)" in r.model_id for r in report.rows)
+    assert "phase1-free-a" in report.raw_responses
+    assert "phase2-free-a" in report.raw_responses
+
+
+def test_council_stops_when_nothing_to_build_on(tmp_path, monkeypatch):
+    reg = _registry(tmp_path, monkeypatch)
+    proj = _project(tmp_path)
+
+    def fake_safe_call(model, prompt, timeout_seconds=180):
+        return ExecutorResult(model.id, "", error="429 nope")
+
+    with mock.patch("council.collab._executor.safe_call", side_effect=fake_safe_call):
+        report = run_council([reg.get("free-a")], "game.py", "write", proj,
+                             _config(), "p")
+    assert report.rows[0].verdict == "CALL_FAIL"
+    assert "phase2" not in "".join(report.raw_responses)
+
+
+def test_write_council_report_goes_to_councils(tmp_path, monkeypatch):
+    reg = _registry(tmp_path, monkeypatch)
+    proj = _project(tmp_path)
+
+    def fake_safe_call(model, prompt, timeout_seconds=180):
+        return ExecutorResult(model.id, "```python\nx = 1\n```", 1, 1, 0.1)
+
+    with mock.patch("council.collab._executor.safe_call", side_effect=fake_safe_call):
+        report = run_council([reg.get("free-a")], "game.py", "write", proj,
+                             _config(), "p")
+    outdir = write_council_report(proj, report)
+    assert outdir.parent.name == "councils"
+    assert (outdir / "summary.md").exists()

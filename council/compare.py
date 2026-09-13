@@ -307,9 +307,10 @@ def run_compare(models: List[ModelEntry], task: Task, project_dir: Path,
     return report
 
 
-def write_compare_report(project_dir: Path, report: CompareReport) -> Path:
-    """Persist responses + scoreboard under .council/compares/<id>/."""
-    outdir = project_dir / ".council" / "compares" / report.compare_id
+def write_compare_report(project_dir: Path, report: CompareReport,
+                         subdir: str = "compares") -> Path:
+    """Persist responses + scoreboard under .council/<subdir>/<id>/."""
+    outdir = project_dir / ".council" / subdir / report.compare_id
     outdir.mkdir(parents=True, exist_ok=True)
     for model_id, text in report.raw_responses.items():
         (outdir / f"{_slug(model_id)}.md").write_text(
