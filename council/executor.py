@@ -207,19 +207,66 @@ def _is_transient(exc: BaseException) -> bool:
 def call_model(model, prompt: str, timeout_seconds: int = 120,
                retries: int = 1,
                workdir: Optional[Path] = None) -> ExecutorResult:
-    """Run one model call via the model's backend (openrouter HTTPS or
-    `opencode run`). Transient failures retry once; anything definitive
-    fails fast.
+    """Run one model call via the model's backend. Transient failures
+    retry once; anything definitive fails fast.
+
+    Backends: openrouter | openai_compatible (Groq, Ollama, OpenAI,
+    Together, ...) | anthropic (native Messages API) | google (native
+    GenerateContent API) | opencode (local CLI, owns its own auth).
     """
-    if getattr(model, "backend", "openrouter") == "opencode":
+    backend = getattr(model, "backend", "openrouter")
+    if backend == "opencode":
         return call_opencode(model, prompt, timeout_seconds, retries, workdir)
+    if backend == "anthropic":
+        return call_anthropic(model, prompt, timeout_seconds, retries)
+    if backend == "google":
+        return call_google(model, prompt, timeout_seconds, retries)
     return call_openrouter(model, prompt, timeout_seconds, retries)
+
+
+def _post_json(req: urllib.request.Request, model_id: str,
+               timeout_seconds: int, retries: int):
+    """POST with one retry on transient failures. Returns the parsed
+    payload. Non-transient HTTP errors raise ExecutorError with the
+    provider's message (truncated)."""
+    attempt = 0
+    while True:
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                return json.load(resp)
+        except Exception as exc:  # noqa: BLE001 — classified below
+            transient = _is_transient(exc)
+            if transient and attempt < retries:
+                attempt += 1
+                time.sleep(RETRY_DELAY_SECONDS)
+                continue
+            if isinstance(exc, urllib.error.HTTPError):
+                try:
+                    detail = exc.read().decode()[:500]
+                except Exception:
+                    detail = ""
+                raise ExecutorError(
+                    f"model '{model_id}' HTTP {exc.code}: {detail or exc.reason}"
+                    + (f" (after {attempt + 1} tries)" if attempt else "")
+                ) from exc
+            if isinstance(exc, TimeoutError):
+                raise ExecutorError(
+                    f"model '{model_id}' timed out after {timeout_seconds}s"
+                    + (f" (after {attempt + 1} tries)" if attempt else "")
+                ) from exc
+            if isinstance(exc, OSError):
+                raise ExecutorError(
+                    f"model '{model_id}' request failed: {exc}"
+                    + (f" (after {attempt + 1} tries)" if attempt else "")
+                ) from exc
+            raise
 
 
 def call_openrouter(model, prompt: str, timeout_seconds: int = 120,
                     retries: int = 1) -> ExecutorResult:
-    """POST one chat completion. `model.endpoint` is the full
-    chat-completions URL; `model.id` is the OpenRouter model id."""
+    """OpenAI-compatible chat completions (OpenRouter, Groq, Ollama,
+    OpenAI, Together, ...). `model.endpoint` is the full completions URL,
+    `model.id` the provider's model name, key from `api_key_env`."""
     from council.registry import ModelEntry  # local import: keeps module import-light
 
     assert isinstance(model, ModelEntry)
@@ -243,38 +290,7 @@ def call_openrouter(model, prompt: str, timeout_seconds: int = 120,
         method="POST",
     )
     started = time.monotonic()
-    attempt = 0
-    while True:
-        try:
-            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
-                payload = json.load(resp)
-            break
-        except Exception as exc:  # noqa: BLE001 — classified below
-            transient = _is_transient(exc)
-            if transient and attempt < retries:
-                attempt += 1
-                time.sleep(RETRY_DELAY_SECONDS)
-                continue
-            if isinstance(exc, urllib.error.HTTPError):
-                try:
-                    detail = exc.read().decode()[:500]
-                except Exception:
-                    detail = ""
-                raise ExecutorError(
-                    f"model '{model.id}' HTTP {exc.code}: {detail or exc.reason}"
-                    + (f" (after {attempt + 1} tries)" if attempt else "")
-                ) from exc
-            if isinstance(exc, TimeoutError):
-                raise ExecutorError(
-                    f"model '{model.id}' timed out after {timeout_seconds}s"
-                    + (f" (after {attempt + 1} tries)" if attempt else "")
-                ) from exc
-            if isinstance(exc, OSError):
-                raise ExecutorError(
-                    f"model '{model.id}' request failed: {exc}"
-                    + (f" (after {attempt + 1} tries)" if attempt else "")
-                ) from exc
-            raise
+    payload = _post_json(req, model.id, timeout_seconds, retries)
 
     latency = time.monotonic() - started
     try:
@@ -290,6 +306,105 @@ def call_openrouter(model, prompt: str, timeout_seconds: int = 120,
         text=text,
         prompt_tokens=int(usage.get("prompt_tokens") or 0),
         completion_tokens=int(usage.get("completion_tokens") or 0),
+        latency_seconds=latency,
+    )
+
+
+def call_anthropic(model, prompt: str, timeout_seconds: int = 120,
+                   retries: int = 1) -> ExecutorResult:
+    """Native Anthropic Messages API. `model.endpoint` is the messages URL
+    (`https://api.anthropic.com/v1/messages`), `model.id` the Anthropic
+    model name. max_tokens is fixed at 4096 — bake-off outputs, not novels."""
+    from council.registry import ModelEntry
+
+    assert isinstance(model, ModelEntry)
+    key = _api_key(model)
+    body = json.dumps({
+        "model": model.id,
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        model.endpoint,
+        data=body,
+        headers={
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "society-of-minds-council/0.1",
+        },
+        method="POST",
+    )
+    started = time.monotonic()
+    payload = _post_json(req, model.id, timeout_seconds, retries)
+    latency = time.monotonic() - started
+    try:
+        text = "".join(
+            block.get("text", "") for block in payload["content"]
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+        if not text:
+            raise ValueError("no text blocks")
+    except (KeyError, TypeError, ValueError) as exc:
+        preview = json.dumps(payload)[:300]
+        raise ExecutorError(
+            f"model '{model.id}' returned an unexpected response shape: {preview}"
+        ) from exc
+    usage = payload.get("usage", {}) or {}
+    return ExecutorResult(
+        model_id=model.id,
+        text=text,
+        prompt_tokens=int(usage.get("input_tokens") or 0),
+        completion_tokens=int(usage.get("output_tokens") or 0),
+        latency_seconds=latency,
+    )
+
+
+def call_google(model, prompt: str, timeout_seconds: int = 120,
+                retries: int = 1) -> ExecutorResult:
+    """Native Google GenerateContent API. `model.endpoint` is the models
+    base (`https://generativelanguage.googleapis.com/v1beta/models`);
+    the key travels in the x-goog-api-key header, never the URL."""
+    from council.registry import ModelEntry
+
+    assert isinstance(model, ModelEntry)
+    key = _api_key(model)
+    url = f"{model.endpoint.rstrip('/')}/{model.id}:generateContent"
+    body = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+    }).encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "x-goog-api-key": key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "society-of-minds-council/0.1",
+        },
+        method="POST",
+    )
+    started = time.monotonic()
+    payload = _post_json(req, model.id, timeout_seconds, retries)
+    latency = time.monotonic() - started
+    try:
+        parts = payload["candidates"][0]["content"]["parts"]
+        text = "".join(
+            part.get("text", "") for part in parts if isinstance(part, dict))
+        if not text:
+            raise ValueError("no text parts")
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        preview = json.dumps(payload)[:300]
+        raise ExecutorError(
+            f"model '{model.id}' returned an unexpected response shape: {preview}"
+        ) from exc
+    usage = payload.get("usageMetadata", {}) or {}
+    return ExecutorResult(
+        model_id=model.id,
+        text=text,
+        prompt_tokens=int(usage.get("promptTokenCount") or 0),
+        completion_tokens=int(usage.get("candidatesTokenCount") or 0),
         latency_seconds=latency,
     )
 

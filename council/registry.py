@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 import yaml
 
 VALID_COST_TIERS = {"free", "paid", "hybrid"}
-VALID_BACKENDS = {"openrouter", "opencode"}
+VALID_BACKENDS = {"openrouter", "opencode", "openai_compatible", "anthropic", "google"}
 VALID_QUALITY_SOURCES = {"user_override", "measured"}  # no scraper/judge — manual only (Section 8)
 REQUIRED_FIELDS = ("id", "provider", "endpoint", "api_key_env", "cost_tier", "capabilities")
 

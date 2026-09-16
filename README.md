@@ -111,6 +111,41 @@ Requires the `opencode` CLI on PATH. The council shells out to
 as cwd, so opencode minds can read your files like any agent session.
 Mix backends freely: `--models "opencode-sonnet,nvidia/nemotron-3.5-lightning:free"`.
 
+## Providers beyond OpenRouter
+One generic client covers every OpenAI-compatible API (Groq, Ollama,
+OpenAI, Together, ...) — just point `endpoint` at its completions URL.
+Anthropic and Google use their native APIs:
+
+```yaml
+- id: "llama-3.3-70b-groq"          # Groq: same protocol, own key+URL
+  provider: "groq"
+  endpoint: "https://api.groq.com/openai/v1/chat/completions"
+  api_key_env: "GROQ_API_KEY"
+  backend: "openai_compatible"
+  cost_tier: "free"
+  capabilities: ["code_generation"]
+
+- id: "qwen3-local"                  # Ollama: local, no key at all
+  provider: "local"
+  endpoint: "http://localhost:11434/v1/chat/completions"
+  api_key_env: "none"
+  backend: "openai_compatible"
+  cost_tier: "free"
+  capabilities: ["code_generation"]
+
+- id: "gemini-2.0-flash"             # Google: native API, key in header
+  provider: "google_ai_studio"
+  endpoint: "https://generativelanguage.googleapis.com/v1beta/models"
+  api_key_env: "GOOGLE_AI_STUDIO_API_KEY"
+  backend: "google"
+  cost_tier: "free"
+  capabilities: ["code_generation"]
+```
+
+`models.yaml.example` has all of these ready to copy. Same scoreboard,
+same verifier, whatever the backend — cost estimates use each entry's
+`cost_per_1k_*` (0.0 for free tiers).
+
 ## Registry loader (`council/registry.py`)
 Loads and validates `models.yaml` (see `models.yaml.example`):
 - Required fields, valid `cost_tier` (`free`/`paid`/`hybrid`)

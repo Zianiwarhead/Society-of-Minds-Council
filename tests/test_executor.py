@@ -244,3 +244,102 @@ def test_parse_opencode_json_events():
     # raw non-JSON falls through untouched
     assert _parse_opencode_output("```python\nx=1\n```") == "```python\nx=1\n```"
     assert _parse_opencode_output("   ") == ""
+
+
+def _backend_model(backend, **overrides) -> ModelEntry:
+    base = dict(
+        id="x/model", provider="test",
+        endpoint="https://example.com/v1/chat/completions",
+        api_key_env="TEST_COUNCIL_KEY", cost_tier="free",
+        capabilities=["code_generation"], backend=backend,
+    )
+    base.update(overrides)
+    return ModelEntry(**base)
+
+
+def _mock_http(monkeypatch, payload):
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _ctx():
+        from council import executor as ex_mod
+        monkeypatch.setenv("TEST_COUNCIL_KEY", "k")
+        with mock.patch.object(ex_mod.urllib.request, "urlopen") as urlopen, \
+             mock.patch.object(ex_mod.json, "load", return_value=payload):
+            resp = mock.MagicMock()
+            resp.__enter__.return_value = resp
+            resp.__exit__.return_value = False
+            urlopen.return_value = resp
+            yield urlopen
+    return _ctx()
+
+
+def test_openai_compatible_backend_uses_entry_endpoint(monkeypatch):
+    from council import executor as ex_mod
+    payload = {"choices": [{"message": {"content": "hi"}}], "usage": {}}
+    with _mock_http(monkeypatch, payload) as urlopen:
+        result = ex_mod.call_model(
+            _backend_model("openai_compatible",
+                           endpoint="https://api.groq.com/openai/v1/chat/completions",
+                           id="llama-3.3-70b-versatile"),
+            "do it", timeout_seconds=5)
+    assert result.ok
+    assert result.text == "hi"
+    req = urlopen.call_args[0][0]
+    assert req.full_url == "https://api.groq.com/openai/v1/chat/completions"
+    sent = json.loads(req.data.decode())
+    assert sent["model"] == "llama-3.3-70b-versatile"
+
+
+def test_anthropic_backend_headers_and_parse(monkeypatch):
+    from council import executor as ex_mod
+    payload = {"content": [{"type": "text", "text": "hello"}],
+               "usage": {"input_tokens": 3, "output_tokens": 2}}
+    with _mock_http(monkeypatch, payload) as urlopen:
+        result = ex_mod.call_model(
+            _backend_model("anthropic",
+                           endpoint="https://api.anthropic.com/v1/messages",
+                           id="claude-sonnet-4-5"),
+            "do it", timeout_seconds=5)
+    assert result.ok
+    assert result.text == "hello"
+    assert (result.prompt_tokens, result.completion_tokens) == (3, 2)
+    req = urlopen.call_args[0][0]
+    assert req.get_header("X-api-key") == "k"
+    assert req.get_header("Anthropic-version") == "2023-06-01"
+    sent = json.loads(req.data.decode())
+    assert sent["model"] == "claude-sonnet-4-5"
+    assert sent["max_tokens"] == 4096
+
+
+def test_google_backend_url_and_parse(monkeypatch):
+    from council import executor as ex_mod
+    payload = {"candidates": [{"content": {"parts": [{"text": "yo"}]}}],
+               "usageMetadata": {"promptTokenCount": 4, "candidatesTokenCount": 1}}
+    with _mock_http(monkeypatch, payload) as urlopen:
+        result = ex_mod.call_model(
+            _backend_model("google",
+                           endpoint="https://generativelanguage.googleapis.com/v1beta/models",
+                           id="gemini-2.0-flash"),
+            "do it", timeout_seconds=5)
+    assert result.ok
+    assert result.text == "yo"
+    assert (result.prompt_tokens, result.completion_tokens) == (4, 1)
+    req = urlopen.call_args[0][0]
+    assert req.full_url.endswith("/gemini-2.0-flash:generateContent")
+    assert req.get_header("X-goog-api-key") == "k"
+    assert "key=" not in req.full_url  # key in header, never the URL
+
+
+def test_unknown_backend_id_rejected_by_registry(tmp_path):
+    # belt-and-braces: registry validation is the gate, executor trusts it
+    import yaml
+    from council.registry import RegistryError, load_registry
+    p = tmp_path / "models.yaml"
+    p.write_text(yaml.safe_dump([{
+        "id": "m", "provider": "x", "endpoint": "https://x",
+        "api_key_env": "K", "cost_tier": "free",
+        "capabilities": ["code_generation"], "backend": "telepathy"}]))
+    import pytest as _pytest
+    with _pytest.raises(RegistryError, match="backend"):
+        load_registry(p)
