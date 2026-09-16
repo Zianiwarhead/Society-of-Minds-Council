@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from council import executor as _executor
+from council import ratelimit as _ratelimit
 from council.compare import (
     CompareReport,
     CompareRow,
@@ -93,6 +94,7 @@ def _fan_out(models: List[ModelEntry], prompts: Dict[str, str],
     workers = max(1, min(len(models), max_workers))
 
     def _call(m: ModelEntry):
+        _ratelimit.get_limiter().acquire(m)
         return m, _executor.safe_call(m, prompts[m.id], timeout_seconds,
                                       workdir=workdir)
 
@@ -156,6 +158,7 @@ def run_council(models: List[ModelEntry], filename: str, task_description: str,
 
         def _review_call(key: str):
             critic = by_key[key]
+            _ratelimit.get_limiter().acquire(critic)
             return key, _executor.safe_call(critic, jobs[key], timeout_seconds)
 
         with ThreadPoolExecutor(max_workers=workers) as pool:

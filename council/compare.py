@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from council import executor as _executor
+from council import ratelimit as _ratelimit
 from council.config import CouncilConfig
 from council.registry import ModelEntry
 from council.task import Task
@@ -175,6 +176,7 @@ def run_create(models: List[ModelEntry], filename: str, task_description: str,
     workers = max(1, min(len(models), max_workers))
 
     def _call(m: ModelEntry):
+        _ratelimit.get_limiter().acquire(m)
         return m, _executor.safe_call(m, prompt, timeout_seconds,
                                           workdir=project_dir)
 
@@ -238,6 +240,7 @@ def run_compare(models: List[ModelEntry], task: Task, project_dir: Path,
     # Parallel fan-out for the network-bound calls, then apply + verify
     # each response in an isolated temp copy (CPU-bound, fast).
     def _call(m: ModelEntry):
+        _ratelimit.get_limiter().acquire(m)
         return m, _executor.safe_call(m, prompt, timeout_seconds,
                                           workdir=project_dir)
 

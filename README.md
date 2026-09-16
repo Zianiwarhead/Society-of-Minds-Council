@@ -33,6 +33,7 @@ sandbox:
 - `council/registry.py`  — loads `models.yaml` overrides (small: your deltas only)
 - `council/discovery.py` — live catalog cache + merge (`models sync`, `--live`)
 - `council/executor.py`  — OpenRouter + OpenCode backends (stdlib only, BYOK via env)
+- `council/ratelimit.py`  — per-key token-bucket pacing for the fan-outs (set `rate_limit_rpm` in models.yaml; fallback 20)
 - `council/compare.py`   — bake-off harness (fan-out, isolated verify, scoreboard)
 - `council/collab.py`    — council harness (write → review → revise, you directing)
 - `council/cli.py`       — `run` / `models` / `compare` / `collab` entry points
