@@ -40,13 +40,20 @@ sandbox:
 - `tests/`               — pytest suite (`pytest tests/ -q`)
 
 ## What this does and doesn't do
-`council run` wires the full local pipeline: ingest → classify →
-select model → run verifier → escalation decision. Exit codes: `0` DONE,
-`1` FAIL with a next model to try, `3` VERIFY_ERROR, `4` HUMAN_REVIEW
-(both write `.council/reviews/<task-id>/` per spec Section 7).
+`council run` is the full loop now: ingest → classify → as-is verify
+(zero-cost: already green means DONE with no model called) → call model
+→ apply diff in an isolated copy → verify there → escalate via
+`decide_next` until DONE, VERIFY_ERROR, or HUMAN_REVIEW. Exit codes:
+`0` DONE, `1` FAIL (e.g. `--apply` couldn't land), `3` VERIFY_ERROR,
+`4` HUMAN_REVIEW (both write `.council/reviews/<task-id>/` with
+`attempt-*.diff` files preserved, per spec Section 7).
 
-No Docker sandbox yet — the verifier runs on host, and compare/collab
-verify in temp copies (never your tree). The council is only as smart
+Nothing is auto-applied by default: a passing diff goes to
+`.council/runs/<task-id>/final.diff` for your review. Pass `--apply`
+to land it directly. `--timeout` sets the per-model call budget.
+
+No Docker sandbox yet — the verifier runs on host, and every attempt
+verifies in temp copies (never your tree). The council is only as smart
 as its verifier: a trivial check grades formatting, a behavioral check
 grades the fix. Parsses ≠ runs (see `examples/verify_game.py`).
 

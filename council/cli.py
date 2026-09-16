@@ -5,22 +5,25 @@
 
 See spec Sections 2 (Task Ingestion), 6 (Classifier), 3 (Verifier),
 7 (Human Review Handoff). This wires config loading + task ingestion +
-registry/model selection + verifier run + escalation decision together.
+registry/model selection + verifier run + escalation decision together —
+and now the actual model-calling loop: on a verify failure, `run` calls
+the next model, applies its diff in an isolated copy (never the working
+tree — see `_fresh_copy`/`_apply_diff` from compare.py), verifies there,
+and loops via `decide_next` until DONE, VERIFY_ERROR, or HUMAN_REVIEW.
 
-What it does NOT do yet: call an LLM to generate a diff. The verifier
-runs against the current working tree as-is, so `run` today validates
-the pipeline (ingest -> select -> verify -> decide next) without
-pretending model codegen exists. Once provider clients land, the
-RUNNING/ESCALATED next-step becomes a real retry with a new model
-instead of a printed pointer.
+Nothing is auto-applied to the working tree by default (Section 7): a
+passing diff is written to `.council/runs/<task-id>/final.diff` for you
+to review and apply yourself. Pass --apply to have it applied directly.
 """
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
-from typing import Optional, List
+from typing import List, Optional
 
+from council import executor as _executor
 from council.classifier import (
     Attempt,
     NoEligibleModelError,
@@ -31,15 +34,20 @@ from council.classifier import (
     required_capabilities,
     select_initial_model,
 )
+from council.compare import _apply_diff, _fresh_copy, collect_context
 from council.config import ConfigError, VerifyStep, load_config
 from council.discovery import (
     DiscoveryError,
     load_merged_registry,
     sync_openrouter,
 )
-from council.task import IngestionError, build_task
-from council.registry import ModelRegistry, RegistryError, load_registry
+from council.task import IngestionError, Task, build_task
+from council.registry import ModelEntry, ModelRegistry, RegistryError, load_registry
 from council.verifier import VerifyReport, run_verifier
+
+MAX_LOOP_ATTEMPTS = 6  # decide_next's own state machine terminates well before
+                       # this (free -> free-retry/escalate -> paid -> HUMAN_REVIEW
+                       # is 3 attempts); this is a safety net, not the real limit.
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -96,6 +104,20 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help="Cache dir for the live catalog. Defaults to ~/.cache/council.",
+    )
+    run.add_argument(
+        "--timeout",
+        type=int,
+        default=120,
+        metavar="SECONDS",
+        help="Per-model call timeout. Defaults to 120.",
+    )
+    run.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the final passing diff to the working tree. Default: "
+             "write it to .council/runs/<task-id>/final.diff and leave your "
+             "tree untouched — nothing is auto-applied unless you opt in.",
     )
 
     models = subparsers.add_parser("models", help="Inspect the model registry.")
@@ -319,9 +341,12 @@ def _write_review(
     state: TaskState,
     reason: str,
     environment_error: bool,
+    diffs: Optional[List[tuple]] = None,  # [(model_id, diff_text), ...] in attempt order
 ) -> Path:
     """Write the Section 7 review record. Never raises — a failed handoff
-    must not mask the original verifier result."""
+    must not mask the original verifier result. `diffs`, when given,
+    preserves every attempted diff alongside the summary — nothing gets
+    lost just because it didn't pass."""
     review_dir = project_dir / ".council" / "reviews" / task_id
     try:
         review_dir.mkdir(parents=True, exist_ok=True)
@@ -346,6 +371,10 @@ def _write_review(
         failing = report.failing_step()
         if failing is not None:
             lines += ["", f"failing_step: {failing.name}"]
+        if diffs:
+            lines += ["", "## Attempts"]
+            for i, (attempt_model_id, _) in enumerate(diffs, start=1):
+                lines.append(f"- attempt-{i}.diff — {attempt_model_id}")
         (review_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
         for i, step in enumerate(report.steps, start=1):
             log = (
@@ -358,9 +387,59 @@ def _write_review(
                 f"--- stderr ---\n{step.stderr}\n"
             )
             (review_dir / f"verify-log-{i}.txt").write_text(log, encoding="utf-8")
+        if diffs:
+            for i, (_, diff_text) in enumerate(diffs, start=1):
+                (review_dir / f"attempt-{i}.diff").write_text(diff_text, encoding="utf-8")
     except OSError as exc:
         print(f"council: warning: could not write review record: {exc}", file=sys.stderr)
     return review_dir
+
+
+def _run_model_attempt(
+    model: ModelEntry, task: Task, project_dir: Path,
+    config, timeout_seconds: int,
+) -> tuple:
+    """Call one model for a fix, apply its diff in an isolated copy (the
+    working tree is never touched here — same guarantee as compare/collab),
+    verify there. Returns (Attempt, VerifyReport | None, diff | None, error | None).
+
+    Model-attributable failures (call error, no diff, unappliable diff)
+    are plain FAILs, not VERIFY_ERRORs: a VERIFY_ERROR would short-circuit
+    `decide_next` straight to the terminal state instead of escalating to
+    the next model, which is exactly what the loop exists to do.
+    """
+    context = collect_context(task, project_dir)
+    prompt = _executor.build_prompt(task.description, context)
+    res = _executor.safe_call(model, prompt, timeout_seconds, workdir=project_dir)
+    if not res.ok:
+        return (
+            Attempt(model_id=model.id, passed=False, verify_error=False),
+            None, None, res.error,
+        )
+
+    diff = _executor.extract_diff(res.text)
+    if not diff:
+        return (
+            Attempt(model_id=model.id, passed=False, verify_error=False),
+            None, None, "model did not return a diff",
+        )
+
+    tmpdir = _fresh_copy(project_dir)
+    try:
+        apply_err = _apply_diff(tmpdir, diff)
+        if apply_err is not None:
+            return (
+                Attempt(model_id=model.id, passed=False, verify_error=False),
+                None, diff, f"diff did not apply: {apply_err}",
+            )
+        workdir = (tmpdir / config.working_dir).resolve() if config.working_dir != "." else tmpdir
+        report = run_verifier(config, workdir)
+        attempt = Attempt(
+            model_id=model.id, passed=report.overall_pass, verify_error=report.verify_error
+        )
+        return attempt, report, diff, None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _cmd_models(args: argparse.Namespace) -> int:
@@ -461,10 +540,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     score = complexity_score(task)
 
     try:
-        model = select_initial_model(registry, task)
+        first_model = select_initial_model(registry, task)
     except NoEligibleModelError as exc:
-        # Fail fast with actionable output (Section 5): name the missing
-        # env vars for the capable pool, not just "no model".
         capable = registry.eligible_for(caps)
         missing = registry.missing_keys(capable) if capable else registry.missing_keys()
         print(f"council: no eligible model: {exc}", file=sys.stderr)
@@ -480,69 +557,115 @@ def _cmd_run(args: argparse.Namespace) -> int:
     print(f"  cross_file_deps   : {task.cross_file_dependencies}")
     print(f"  complexity        : {complexity} (score {score})")
     print(f"  required_caps     : {caps}")
-    print(f"  selected_model    : {model.id} [{model.cost_tier}]")
+    print(f"  first_model       : {first_model.id} [{first_model.cost_tier}]")
     print(f"  sandbox.image     : {config.sandbox.image}")
     if live_note:
         print(f"  registry          : {live_note}")
     print()
 
+    # Zero-cost check: does the current tree already pass, with no model
+    # called at all? This is the free-first philosophy taken to its logical
+    # end — don't spend a single token if nothing needs fixing.
     workdir = (project_dir / config.working_dir).resolve()
-    report = run_verifier(config, workdir)
-
-    for step in report.steps:
+    as_is_report = run_verifier(config, workdir)
+    for step in as_is_report.steps:
         status = "PASS" if step.passed else "FAIL"
         extra = f" error={step.error}" if step.error else ""
-        print(f"  verify {step.name}: {status}{extra}")
+        print(f"  as-is verify {step.name}: {status}{extra}")
 
-    attempt = Attempt(
-        model_id=model.id,
-        passed=report.overall_pass,
-        verify_error=report.verify_error,
-    )
-    try:
-        next_step = decide_next(task, registry, [attempt])
-    except NoEligibleModelError as exc:
-        print(f"council: escalation failed: {exc}", file=sys.stderr)
-        review_dir = _write_review(
-            project_dir, task.id, task.description, model.id,
-            report, TaskState.HUMAN_REVIEW, str(exc), False,
-        )
-        print(f"council: HUMAN_REVIEW — see {review_dir}", file=sys.stderr)
-        return 4
-
-    if next_step.state == TaskState.DONE:
-        print(f"\ncouncil: DONE — verifier passed on {model.id}")
+    if as_is_report.overall_pass:
+        print("\ncouncil: DONE — verifier already passes on the current tree (no model called)")
         return 0
 
-    if next_step.state == TaskState.VERIFY_ERROR:
-        review_dir = _write_review(
-            project_dir, task.id, task.description, model.id,
-            report, next_step.state, next_step.reason, True,
-        )
-        print(f"\ncouncil: VERIFY_ERROR — {next_step.reason}", file=sys.stderr)
-        print(f"council: review record at {review_dir}", file=sys.stderr)
-        return 3
+    print(f"\ncouncil: current tree fails verify — engaging {first_model.id}\n")
 
-    if next_step.state == TaskState.HUMAN_REVIEW:
-        review_dir = _write_review(
-            project_dir, task.id, task.description, model.id,
-            report, next_step.state, next_step.reason, False,
-        )
-        print(f"\ncouncil: HUMAN_REVIEW — {next_step.reason}", file=sys.stderr)
-        print(f"council: review record at {review_dir}", file=sys.stderr)
-        return 4
+    attempts: List[Attempt] = []
+    diffs: List[tuple] = []  # [(model_id, diff_text), ...] in attempt order
+    current_model = first_model
 
-    # RUNNING or ESCALATED with a next model: no LLM codegen yet, so stop
-    # here and point at the next step instead of looping.
-    print(
-        f"\ncouncil: verifier FAILED on {model.id} — next: "
-        f"{next_step.state.value} with {next_step.model.id} ({next_step.reason})"
+    for _ in range(MAX_LOOP_ATTEMPTS):
+        print(f"council: trying {current_model.id} [{current_model.cost_tier}]...")
+        attempt, vreport, diff, call_err = _run_model_attempt(
+            current_model, task, project_dir, config, args.timeout,
+        )
+        attempts.append(attempt)
+        if diff:
+            diffs.append((current_model.id, diff))
+
+        if call_err:
+            print(f"  -> {call_err}")
+        elif vreport is not None:
+            for step in vreport.steps:
+                status = "PASS" if step.passed else "FAIL"
+                extra = f" error={step.error}" if step.error else ""
+                print(f"  verify {step.name}: {status}{extra}")
+
+        try:
+            next_step = decide_next(task, registry, attempts)
+        except NoEligibleModelError as exc:
+            fallback_report = vreport if vreport is not None else as_is_report
+            review_dir = _write_review(
+                project_dir, task.id, task.description, current_model.id,
+                fallback_report, TaskState.HUMAN_REVIEW, str(exc), False, diffs,
+            )
+            print(f"council: escalation failed: {exc}", file=sys.stderr)
+            print(f"council: HUMAN_REVIEW — see {review_dir}", file=sys.stderr)
+            return 4
+
+        if next_step.state == TaskState.DONE:
+            final_model_id, final_diff = diffs[-1]
+            out_dir = project_dir / ".council" / "runs" / task.id
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / "final.diff"
+            out_path.write_text(final_diff, encoding="utf-8")
+            print(f"\ncouncil: DONE — {final_model_id} passed verify.")
+            print(f"council: diff written to {out_path}")
+            if args.apply:
+                apply_err = _apply_diff(project_dir, final_diff)
+                if apply_err is not None:
+                    print(f"council: --apply failed: {apply_err}", file=sys.stderr)
+                    print("council: your working tree is unchanged; apply the diff manually.")
+                    return 1
+                print("council: applied to your working tree (--apply).")
+            else:
+                print("council: nothing was applied to your working tree — "
+                      "review the diff and apply it yourself, or re-run with --apply.")
+            return 0
+
+        fallback_report = vreport if vreport is not None else as_is_report
+
+        if next_step.state == TaskState.VERIFY_ERROR:
+            review_dir = _write_review(
+                project_dir, task.id, task.description, current_model.id,
+                fallback_report, next_step.state, next_step.reason, True, diffs,
+            )
+            print(f"\ncouncil: VERIFY_ERROR — {next_step.reason}", file=sys.stderr)
+            print(f"council: review record at {review_dir}", file=sys.stderr)
+            return 3
+
+        if next_step.state == TaskState.HUMAN_REVIEW:
+            review_dir = _write_review(
+                project_dir, task.id, task.description, current_model.id,
+                fallback_report, next_step.state, next_step.reason, False, diffs,
+            )
+            print(f"\ncouncil: HUMAN_REVIEW — {next_step.reason}", file=sys.stderr)
+            print(f"council: review record at {review_dir}", file=sys.stderr)
+            return 4
+
+        # RUNNING or ESCALATED with a next model — loop.
+        print(f"  -> {next_step.state.value}: next is {next_step.model.id} ({next_step.reason})\n")
+        current_model = next_step.model
+
+    # Safety net only — decide_next's own state machine terminates in at
+    # most 3 attempts, so this should never actually trigger.
+    print("council: exceeded max attempts without resolution — treating as HUMAN_REVIEW", file=sys.stderr)
+    review_dir = _write_review(
+        project_dir, task.id, task.description, current_model.id,
+        vreport if vreport is not None else as_is_report,
+        TaskState.HUMAN_REVIEW, "exceeded max loop attempts", False, diffs,
     )
-    print(
-        "(model codegen not implemented yet — apply a fix and re-run, "
-        "or wire provider clients to retry automatically)"
-    )
-    return 1
+    print(f"council: review record at {review_dir}", file=sys.stderr)
+    return 4
 
 
 def _select_pool(registry: ModelRegistry, args: argparse.Namespace) -> tuple[list, Optional[str]]:
@@ -685,7 +808,7 @@ def _cmd_collab(args: argparse.Namespace) -> int:
     if live_note:
         print(f"  registry: {live_note}")
     print(f"  pool: {', '.join(m.id for m in pool)}")
-    print("  rounds: write -> critique+revise -> best verified wins")
+    print("  rounds: write -> review -> revise -> best verified wins")
     human_notes = ""
     if getattr(args, "feedback", None):
         try:
